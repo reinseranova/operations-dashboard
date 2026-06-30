@@ -73,6 +73,10 @@ export interface Snapshot {
   shiphero: {
     /** True when running on placeholder data because no refresh token is set. */
     stubbed: boolean;
+    /** "ok" normally; "error" when the live ShipHero API call failed. */
+    status: "ok" | "error";
+    /** Underlying error detail when status is "error" (shown in a banner). */
+    message?: string;
   };
   shopify: {
     status: ShopifyStatus;

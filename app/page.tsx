@@ -97,6 +97,12 @@ export default async function DashboardPage() {
             Showing sample ShipHero data — real credentials not yet connected.
           </Banner>
         )}
+        {!snapshot.shiphero.stubbed && snapshot.shiphero.status === "error" && (
+          <Banner tone="red">
+            Couldn’t load ShipHero data
+            {snapshot.shiphero.message ? `: ${snapshot.shiphero.message}` : ""}.
+          </Banner>
+        )}
         {shopifyBanner(snapshot.shopify.status, snapshot.shopify.message)}
       </div>
 

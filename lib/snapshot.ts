@@ -10,15 +10,72 @@ import { ROLLING_WINDOW_DAYS, KV_KEYS } from "./config";
 import { isKvConfigured, kvGet, kvSet } from "./kv";
 import { getShopifyData } from "./shopify";
 import { getShipHeroInventory, getShipHeroSummary, isShipHeroStubbed } from "./shiphero";
-import type { Snapshot, SkuRow } from "./types";
+import type {
+  Snapshot,
+  SkuRow,
+  ShipHeroInventory,
+  ShipHeroSummary,
+} from "./types";
+
+function emptyShipHeroSummary(): ShipHeroSummary {
+  return {
+    ordersFulfilledToday: 0,
+    ordersOnHold: {
+      total: 0,
+      breakdown: {
+        fraud_hold: 0,
+        address_hold: 0,
+        shipping_method_hold: 0,
+        operator_hold: 0,
+        payment_hold: 0,
+        client_hold: 0,
+      },
+    },
+    returnsToday: 0,
+    newReceivalsToday: 0,
+  };
+}
 
 /** Pull from both sources and compute every metric. */
 export async function computeSnapshot(): Promise<Snapshot> {
-  const [inventory, summary, shopify] = await Promise.all([
-    getShipHeroInventory(),
-    getShipHeroSummary(),
+  // ShipHero and Shopify are pulled independently so a failure in one never
+  // takes down the whole dashboard. ShipHero is the source of the SKU list, so
+  // when it errors we still render (with a banner) rather than throwing.
+  let inventory: ShipHeroInventory = { skus: [] };
+  let summary: ShipHeroSummary = emptyShipHeroSummary();
+  let shipheroStatus: "ok" | "error" = "ok";
+  let shipheroMessage: string | undefined;
+
+  const [inventoryResult, summaryResult, shopify] = await Promise.all([
+    getShipHeroInventory().then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
+    getShipHeroSummary().then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
     getShopifyData(),
   ]);
+
+  if (inventoryResult.ok) {
+    inventory = inventoryResult.v;
+  } else {
+    shipheroStatus = "error";
+    shipheroMessage =
+      inventoryResult.e instanceof Error
+        ? inventoryResult.e.message
+        : "Unknown ShipHero error";
+  }
+  if (summaryResult.ok) {
+    summary = summaryResult.v;
+  } else if (shipheroStatus === "ok") {
+    shipheroStatus = "error";
+    shipheroMessage =
+      summaryResult.e instanceof Error
+        ? summaryResult.e.message
+        : "Unknown ShipHero error";
+  }
 
   const sales = shopify.salesBySku;
 
@@ -67,7 +124,11 @@ export async function computeSnapshot(): Promise<Snapshot> {
       newReceivalsToday: summary.newReceivalsToday,
       ordersCreatedTodayShopify: shopify.ordersCreatedToday,
     },
-    shiphero: { stubbed: isShipHeroStubbed() },
+    shiphero: {
+      stubbed: isShipHeroStubbed(),
+      status: shipheroStatus,
+      message: shipheroMessage,
+    },
     shopify: { status: shopify.status, message: shopify.message },
   };
 }
