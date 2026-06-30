@@ -1,6 +1,6 @@
 # Inventory & Fulfillment Ops Dashboard
 
-A small internal dashboard that combines **live Shopify** sales data with
+A small internal dashboard that will combine **live Shopify** sales data with
 **ShipHero** inventory & fulfillment data into one view of inventory and
 fulfillment health. Built with Next.js (App Router) + TypeScript + Tailwind,
 designed to deploy on Vercel.
