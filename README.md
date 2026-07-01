@@ -1,14 +1,13 @@
 # Inventory & Fulfillment Ops Dashboard
 
-A small internal dashboard that will combine **live Shopify** sales data with
+A small internal dashboard that combines **live Shopify** sales data with
 **ShipHero** inventory & fulfillment data into one view of inventory and
 fulfillment health. Built with Next.js (App Router) + TypeScript + Tailwind,
 designed to deploy on Vercel.
 
-> **Current status:** Shopify metrics are **real** (live Admin API). ShipHero
-> metrics are **stubbed** with realistic sample data until ShipHero credentials
-> are provided. When the ShipHero refresh token is added, the real API turns on
-> automatically — the only file that changes is `lib/shiphero.ts`.
+> **Current status:** all metrics are **live** — Shopify sales via the Admin
+> API, and ShipHero stock/lots/fulfillment/holds/returns/receivals via the
+> ShipHero Public API. There is no placeholder data.
 
 ---
 
@@ -60,22 +59,25 @@ To stop the app, go back to the terminal and press `Ctrl + C`.
 
 ---
 
-## What's real vs. stubbed
+## Data sources
 
-| Metric | Source | Status |
-| --- | --- | --- |
-| Sales velocity / units sold (30d) | Shopify Admin API | **Real** |
-| Days of stock (uses Shopify velocity) | Shopify + ShipHero | **Real velocity**, stubbed stock |
-| Orders created today | Shopify Admin API | **Real** |
-| Current stock per SKU (NV / PA / total) | ShipHero | Stubbed |
-| Lots per SKU (number, qty, expiration) | ShipHero | Stubbed |
-| Orders fulfilled today | ShipHero | Stubbed |
-| Orders on hold (total + breakdown) | ShipHero | Stubbed |
-| Returns received/processed today | ShipHero | Stubbed |
-| New receivals today | ShipHero | Stubbed |
+| Metric | Source |
+| --- | --- |
+| Sales velocity / units sold (30d) | Shopify Admin API |
+| Orders created today | Shopify Admin API |
+| Current stock per SKU (NV / PA / total) | ShipHero `warehouse_products` |
+| Days of stock (stock ÷ Shopify velocity) | ShipHero stock + Shopify velocity |
+| Lots per SKU (number, qty, expiration) | ShipHero `expiration_lots` |
+| Orders fulfilled today | ShipHero `orders` |
+| Orders on hold (total + breakdown) | ShipHero `orders(has_hold)` |
+| Returns received today | ShipHero `returns` |
+| New receivals today | ShipHero `warehouse_products.inbounds` |
 
-ShipHero metrics switch from stubbed to real automatically once
-`SHIPHERO_REFRESH_TOKEN` is set — no code changes beyond that.
+All metrics are live. ShipHero warehouse IDs are resolved by name at runtime
+(never hardcoded); if a configured name can't be matched, the dashboard shows a
+banner listing the actual warehouses ShipHero returned so `WAREHOUSES` in
+`lib/config.ts` can be corrected. `lib/shiphero.ts` remains the single file
+holding all ShipHero API logic.
 
 ---
 
@@ -90,8 +92,8 @@ settings for production. See `.env.example` for a copy-paste template.
 | `SHOPIFY_ADMIN_ACCESS_TOKEN` | **Yes** | Shopify Admin API token. Scopes: `read_products`, `read_orders`. |
 | `DASHBOARD_PASSWORD` | **Yes** | Single shared password for the team login. |
 | `REFRESH_SECRET` | **Yes** | Shared secret protecting `/api/refresh`. |
-| `SHIPHERO_ACCESS_TOKEN` | No | ShipHero access token (optional; app stubs without it). |
-| `SHIPHERO_REFRESH_TOKEN` | No | ShipHero refresh token. **Setting this turns on the real ShipHero API.** |
+| `SHIPHERO_REFRESH_TOKEN` | **Yes** | ShipHero refresh token; used to mint/renew the access token. Required for live ShipHero data. |
+| `SHIPHERO_ACCESS_TOKEN` | No | Optional; the app mints an access token from the refresh token and caches it, so this isn't required. |
 | `CRON_SECRET` | Vercel only | Set equal to `REFRESH_SECRET`; Vercel auto-attaches it to scheduled cron calls. |
 | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | No | Auto-injected by Vercel when you connect KV/Upstash. Enables cached snapshots. |
 

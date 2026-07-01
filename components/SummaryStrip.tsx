@@ -75,7 +75,7 @@ export function SummaryStrip({ summary }: { summary: DailySummary }) {
       <Stat
         label="Returns today"
         value={fmt(summary.returnsToday)}
-        sub="Received = processed"
+        sub="Return records received"
       />
       <Stat label="New receivals today" value={fmt(summary.newReceivalsToday)} />
     </section>

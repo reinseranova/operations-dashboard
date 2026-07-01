@@ -1,42 +1,31 @@
 /**
- * ShipHero Public API layer.
+ * ShipHero Public API layer — live data only.
  *
- * ============================ IMPORTANT ====================================
- * This is the ONLY file that needs to change when real ShipHero credentials
- * arrive. Today, because `SHIPHERO_REFRESH_TOKEN` is not set, every exported
- * function returns realistic placeholder data and `isShipHeroStubbed()` is
- * true so the UI can show a "sample data" banner. The moment that env var is
- * present, the real implementations below run automatically — no other file
- * changes required.
- * ===========================================================================
+ * All queries here follow ShipHero's schema conventions (verified against the
+ * live schema reference at developer.shiphero.com/schema/queries/):
+ *   - Every top-level query returns `{ request_id, complexity, data }`; `data`
+ *     is a connection for list queries.
+ *   - FILTER arguments (warehouse_id, sku, updated_from, has_hold, …) go on the
+ *     top-level query field. PAGINATION (`first`, `after`) goes on the inner
+ *     `data(...)` connection — NOT on the query field.
+ *   - Cursor pagination: read `data.pageInfo { hasNextPage, endCursor }` and
+ *     pass `after`. The account shares a credit pool, so queries stay lean and
+ *     back off on throttle.
  *
- * Data surfaced (per the build spec):
- *   - Stock per SKU per warehouse (on_hand), NV + PA.
- *   - Lots per SKU per warehouse (lot number, quantity, expiration date).
- *   - Orders fulfilled today.
- *   - Orders on hold: total + breakdown across the six hold booleans.
- *   - Returns received/processed today (a single event in ShipHero — see below).
- *   - New receivals today.
+ * Metric → query mapping:
+ *   - Stock per SKU per warehouse …… `warehouse_products(warehouse_id)` → on_hand
+ *   - Warehouse IDs (by name) ……… `account` → data.warehouses (cached)
+ *   - Lots per SKU …………………… `expiration_lots` → Lot + nested locations
+ *   - Orders on hold + breakdown … `orders(has_hold: true)` → holds { … }
+ *   - Orders fulfilled today ……… `orders(fulfillment_status, updated_from)`
+ *   - Returns received today ……… `returns(date_from)` → created_at
+ *   - New receivals today ………… `warehouse_products(updated_from).inbounds`
  *
- * Real-API notes (used only when credentials exist):
- *   - Auth is token-based. Access tokens expire after ~28 days and are renewed
- *     by POSTing { refresh_token } to the refresh endpoint. We cache the live
- *     access token (in KV when available, else in memory) and refresh on 401.
- *     https://developer.shiphero.com/getting-started/
- *   - Warehouse IDs are opaque, so we identify warehouses by their human name.
- *     ShipHero shows warehouses as "identifier / profile" (e.g. identifier
- *     "NV LG Express, Inc." + profile "Primary"), which we reconstruct and
- *     match against the two configured names. Nothing is hardcoded by ID.
- *   - Returns: per the Returns flow docs, "received" and "processed" are the
- *     same event in this API, so we surface ONE number and the UI notes that.
- *     https://developer.shiphero.com/flows/returns/
- *
- * Resilience: ShipHero's GraphQL throttles by query complexity and its schema
- * has many optional shapes. Each summary metric is computed independently and
- * degrades to a safe default (with the underlying error logged) so one bad
- * query can't blank the whole dashboard; inventory errors propagate so the UI
- * can show a clear banner. GraphQL errors include the response body to make
- * any schema mismatch immediately diagnosable from the server logs.
+ * Resilience: the core (warehouse resolution + stock) surfaces errors so the UI
+ * shows a clear banner. Secondary metrics (holds, fulfilled, returns, receivals,
+ * lots) each degrade to a safe default and add a human-readable warning instead
+ * of taking down the whole dashboard. GraphQL errors carry the raw response body
+ * so any schema mismatch is diagnosable from the banner / logs.
  */
 import {
   SHIPHERO_GRAPHQL_ENDPOINT,
@@ -53,23 +42,14 @@ import type {
   ShipHeroSummary,
 } from "./types";
 
-/** True when we're running on placeholder data (no refresh token configured). */
-export function isShipHeroStubbed(): boolean {
-  return !process.env.SHIPHERO_REFRESH_TOKEN;
+export interface InventoryResult {
+  inventory: ShipHeroInventory;
+  warnings: string[];
 }
 
-// ===========================================================================
-// PUBLIC API
-// ===========================================================================
-
-export async function getShipHeroInventory(): Promise<ShipHeroInventory> {
-  if (isShipHeroStubbed()) return stubInventory();
-  return realInventory();
-}
-
-export async function getShipHeroSummary(): Promise<ShipHeroSummary> {
-  if (isShipHeroStubbed()) return stubSummary();
-  return realSummary();
+export interface SummaryResult {
+  summary: ShipHeroSummary;
+  warnings: string[];
 }
 
 function emptyBreakdown(): HoldsBreakdown {
@@ -83,152 +63,14 @@ function emptyBreakdown(): HoldsBreakdown {
   };
 }
 
-// ===========================================================================
-// STUB IMPLEMENTATION (active until SHIPHERO_REFRESH_TOKEN is set)
-// ===========================================================================
-
-const STUB_SKUS: Array<{
-  sku: string;
-  name: string;
-  nv: number;
-  pa: number;
-  lots: Array<{ wh: WarehouseKey; lot: string; qty: number; exp: string | null }>;
-}> = [
-  {
-    sku: "LG-VITD3-5000",
-    name: "Vitamin D3 5000 IU — 120ct",
-    nv: 1840,
-    pa: 920,
-    lots: [
-      { wh: "nv", lot: "D3-2405A", qty: 1200, exp: "2027-04-30" },
-      { wh: "nv", lot: "D3-2312B", qty: 640, exp: "2026-12-31" },
-      { wh: "pa", lot: "D3-2405A", qty: 920, exp: "2027-04-30" },
-    ],
-  },
-  {
-    sku: "LG-OMEGA3-1000",
-    name: "Omega-3 Fish Oil 1000mg — 90ct",
-    nv: 430,
-    pa: 210,
-    lots: [
-      { wh: "nv", lot: "OM-2403C", qty: 430, exp: "2026-09-30" },
-      { wh: "pa", lot: "OM-2403C", qty: 210, exp: "2026-09-30" },
-    ],
-  },
-  {
-    sku: "LG-MAG-GLY-400",
-    name: "Magnesium Glycinate 400mg — 180ct",
-    nv: 75,
-    pa: 40,
-    lots: [
-      { wh: "nv", lot: "MG-2406A", qty: 75, exp: "2027-06-30" },
-      { wh: "pa", lot: "MG-2406A", qty: 40, exp: "2027-06-30" },
-    ],
-  },
-  {
-    sku: "LG-ZINC-50",
-    name: "Zinc Picolinate 50mg — 100ct",
-    nv: 2200,
-    pa: 1750,
-    lots: [
-      { wh: "nv", lot: "ZN-2404A", qty: 2200, exp: "2028-01-31" },
-      { wh: "pa", lot: "ZN-2404A", qty: 1750, exp: "2028-01-31" },
-    ],
-  },
-  {
-    sku: "LG-COQ10-200",
-    name: "CoQ10 200mg — 60ct",
-    nv: 18,
-    pa: 6,
-    lots: [
-      { wh: "nv", lot: "CQ-2402B", qty: 18, exp: "2026-08-31" },
-      { wh: "pa", lot: "CQ-2402B", qty: 6, exp: "2026-08-31" },
-    ],
-  },
-  {
-    sku: "LG-PROBIO-50B",
-    name: "Probiotic 50 Billion CFU — 30ct",
-    nv: 610,
-    pa: 0,
-    lots: [{ wh: "nv", lot: "PB-2405D", qty: 610, exp: "2026-11-30" }],
-  },
-  {
-    sku: "LG-CREATINE-300",
-    name: "Creatine Monohydrate 300g",
-    nv: 940,
-    pa: 880,
-    lots: [
-      { wh: "nv", lot: "CR-2406A", qty: 940, exp: null },
-      { wh: "pa", lot: "CR-2406A", qty: 880, exp: null },
-    ],
-  },
-  {
-    sku: "LG-ASHWA-600",
-    name: "Ashwagandha KSM-66 600mg — 120ct",
-    nv: 0,
-    pa: 0,
-    lots: [],
-  },
-  {
-    sku: "LG-MULTI-MEN",
-    name: "Men's Daily Multivitamin — 90ct",
-    nv: 3100,
-    pa: 2400,
-    lots: [
-      { wh: "nv", lot: "MM-2404A", qty: 1800, exp: "2027-03-31" },
-      { wh: "nv", lot: "MM-2401A", qty: 1300, exp: "2026-10-31" },
-      { wh: "pa", lot: "MM-2404A", qty: 2400, exp: "2027-03-31" },
-    ],
-  },
-];
-
-function whName(key: WarehouseKey): string {
+function warehouseNameFor(key: WarehouseKey): string {
   return WAREHOUSES.find((w) => w.key === key)!.name;
 }
 
-function stubInventory(): ShipHeroInventory {
-  return {
-    skus: STUB_SKUS.map((s) => ({
-      sku: s.sku,
-      productName: s.name,
-      onHand: { nv: s.nv, pa: s.pa },
-      lots: s.lots.map<Lot>((l) => ({
-        warehouseKey: l.wh,
-        warehouseName: whName(l.wh),
-        lotNumber: l.lot,
-        quantity: l.qty,
-        expirationDate: l.exp,
-      })),
-    })),
-  };
-}
-
-function stubSummary(): ShipHeroSummary {
-  const breakdown: HoldsBreakdown = {
-    fraud_hold: 3,
-    address_hold: 7,
-    shipping_method_hold: 1,
-    operator_hold: 2,
-    payment_hold: 4,
-    client_hold: 5,
-  };
-  // Total = orders with ANY hold true; not the sum of the breakdown (an order
-  // can have multiple holds). Kept deliberately below the breakdown sum.
-  const total = 18;
-  return {
-    ordersFulfilledToday: 1242,
-    ordersOnHold: { total, breakdown },
-    returnsToday: 34,
-    newReceivalsToday: 5,
-  };
-}
-
 // ===========================================================================
-// REAL IMPLEMENTATION (runs automatically once SHIPHERO_REFRESH_TOKEN is set)
+// Auth: refresh-token → access-token, cached (KV when available, else memory)
 // ===========================================================================
 
-// In-memory access-token cache for when KV isn't configured. Survives within a
-// warm serverless instance; refreshed on expiry / 401.
 let memToken: { accessToken: string; expiresAt: number } | null = null;
 
 interface CachedToken {
@@ -240,9 +82,7 @@ async function getAccessToken(forceRefresh = false): Promise<string> {
   const now = Date.now();
 
   if (!forceRefresh) {
-    if (memToken && memToken.expiresAt > now + 60_000) {
-      return memToken.accessToken;
-    }
+    if (memToken && memToken.expiresAt > now + 60_000) return memToken.accessToken;
     if (isKvConfigured()) {
       const cached = await kvGet<CachedToken>(KV_KEYS.shipheroToken);
       if (cached && cached.expiresAt > now + 60_000) {
@@ -252,127 +92,311 @@ async function getAccessToken(forceRefresh = false): Promise<string> {
     }
   }
 
+  if (!process.env.SHIPHERO_REFRESH_TOKEN) {
+    throw new Error("SHIPHERO_REFRESH_TOKEN is not set.");
+  }
+
   const res = await fetch(SHIPHERO_REFRESH_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      refresh_token: process.env.SHIPHERO_REFRESH_TOKEN,
-    }),
+    body: JSON.stringify({ refresh_token: process.env.SHIPHERO_REFRESH_TOKEN }),
     cache: "no-store",
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
-    throw new Error(
-      `ShipHero token refresh failed: ${res.status} ${detail.slice(0, 300)}`,
-    );
+    throw new Error(`ShipHero token refresh failed: ${res.status} ${detail.slice(0, 300)}`);
   }
-  const json = (await res.json()) as {
-    access_token: string;
-    expires_in?: number;
-  };
-  // Tokens last ~28 days; trust expires_in when present, else assume 27 days.
+  const json = (await res.json()) as { access_token: string; expires_in?: number };
   const ttlMs = (json.expires_in ?? 27 * 24 * 60 * 60) * 1000;
-  const token: CachedToken = {
-    accessToken: json.access_token,
-    expiresAt: now + ttlMs,
-  };
+  const token: CachedToken = { accessToken: json.access_token, expiresAt: now + ttlMs };
   memToken = token;
   if (isKvConfigured()) {
-    await kvSet(KV_KEYS.shipheroToken, token, {
-      ttlSeconds: Math.floor(ttlMs / 1000),
-    });
+    await kvSet(KV_KEYS.shipheroToken, token, { ttlSeconds: Math.floor(ttlMs / 1000) });
   }
   return token.accessToken;
 }
+
+// ===========================================================================
+// GraphQL client with 401 refresh + throttle backoff
+// ===========================================================================
 
 interface GraphQLEnvelope<T> {
   data?: T;
   errors?: Array<{ message: string; code?: number }>;
 }
 
-/**
- * POST a GraphQL query to ShipHero, refreshing the token once on a 401.
- *
- * Any failure includes the raw response body so a schema mismatch (ShipHero
- * returns HTTP 400 with a JSON description of the offending field) is visible
- * in the server logs / error banner rather than just "HTTP 400".
- */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function shipheroGraphQL<T>(
   query: string,
   variables: Record<string, unknown> = {},
-  _retried = false,
 ): Promise<T> {
-  const token = await getAccessToken();
-  const res = await fetch(SHIPHERO_GRAPHQL_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ query, variables }),
-    cache: "no-store",
-  });
+  const maxAttempts = 5;
+  let refreshedOn401 = false;
 
-  if (res.status === 401 && !_retried) {
-    await getAccessToken(true); // force refresh, then retry once
-    return shipheroGraphQL<T>(query, variables, true);
-  }
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const token = await getAccessToken();
+    const res = await fetch(SHIPHERO_GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ query, variables }),
+      cache: "no-store",
+    });
 
-  const raw = await res.text();
-  let body: GraphQLEnvelope<T>;
-  try {
-    body = JSON.parse(raw) as GraphQLEnvelope<T>;
-  } catch {
-    throw new Error(`ShipHero GraphQL HTTP ${res.status}: ${raw.slice(0, 400)}`);
-  }
+    if (res.status === 401 && !refreshedOn401) {
+      refreshedOn401 = true;
+      await getAccessToken(true); // force refresh, then retry
+      continue;
+    }
 
-  if (body.errors && body.errors.length > 0) {
-    throw new Error(
-      `ShipHero GraphQL error: ${body.errors.map((e) => e.message).join("; ")}`,
+    if (res.status === 429) {
+      await sleep(Math.min(1000 * 2 ** attempt, 16000));
+      continue;
+    }
+
+    const raw = await res.text();
+    let body: GraphQLEnvelope<T>;
+    try {
+      body = JSON.parse(raw) as GraphQLEnvelope<T>;
+    } catch {
+      throw new Error(`ShipHero GraphQL HTTP ${res.status}: ${raw.slice(0, 400)}`);
+    }
+
+    const throttled = body.errors?.some((e) =>
+      /throttle|credit|too many|rate limit/i.test(e.message),
     );
+    if (throttled && attempt < maxAttempts) {
+      await sleep(Math.min(1000 * 2 ** attempt, 16000));
+      continue;
+    }
+
+    if (body.errors && body.errors.length > 0) {
+      throw new Error(
+        `ShipHero GraphQL error: ${body.errors.map((e) => e.message).join("; ")}`,
+      );
+    }
+    if (!res.ok) {
+      throw new Error(`ShipHero GraphQL HTTP ${res.status}: ${raw.slice(0, 400)}`);
+    }
+    if (!body.data) throw new Error("ShipHero GraphQL returned no data");
+    return body.data;
   }
-  if (!res.ok) {
-    throw new Error(`ShipHero GraphQL HTTP ${res.status}: ${raw.slice(0, 400)}`);
+
+  throw new Error("ShipHero GraphQL failed after retries (throttled or 401).");
+}
+
+// ===========================================================================
+// Warehouse resolution (by name → real ID), cached
+// ===========================================================================
+
+interface AccountWarehouse {
+  id: string;
+  legacy_id: number | null;
+  identifier: string | null;
+  company_name: string | null;
+  company_alias: string | null;
+}
+
+let warehouseIdMemo: Record<WarehouseKey, string> | null = null;
+
+/** True if any of the warehouse's names (or an "A / B" combination) equals `name`. */
+function warehouseMatchesName(w: AccountWarehouse, name: string): boolean {
+  const target = name.trim().toLowerCase();
+  const parts = [w.identifier, w.company_name, w.company_alias]
+    .map((s) => (s ?? "").trim())
+    .filter(Boolean);
+  const candidates = new Set<string>(parts.map((p) => p.toLowerCase()));
+  for (const a of parts) {
+    for (const b of parts) {
+      if (a !== b) candidates.add(`${a} / ${b}`.toLowerCase());
+    }
   }
-  if (!body.data) throw new Error("ShipHero GraphQL returned no data");
-  return body.data;
+  return candidates.has(target);
 }
 
 /**
- * Map a warehouse to our internal key by name. ShipHero presents warehouses as
- * "identifier / profile"; we match the reconstructed combined string first,
- * then fall back to profile- or identifier-only matches.
+ * Resolve the two configured warehouse names to their ShipHero IDs. Cached in
+ * memory and KV. If a name can't be matched, throws an error listing the actual
+ * warehouses ShipHero returned so the configured names can be corrected.
  */
-function warehouseKeyByName(
-  identifier: string | null,
-  profile: string | null,
-): WarehouseKey | null {
-  const id = (identifier ?? "").trim();
-  const prof = (profile ?? "").trim();
-  const candidates = [`${id} / ${prof}`.trim(), prof, id].filter(Boolean);
+async function resolveWarehouseIds(): Promise<Record<WarehouseKey, string>> {
+  if (warehouseIdMemo) return warehouseIdMemo;
+  if (isKvConfigured()) {
+    const cached = await kvGet<Record<WarehouseKey, string>>(KV_KEYS.shipheroWarehouses);
+    if (cached) {
+      warehouseIdMemo = cached;
+      return cached;
+    }
+  }
+
+  const data = await shipheroGraphQL<{
+    account: { data: { warehouses: AccountWarehouse[] | null } };
+  }>(/* GraphQL */ `
+    query {
+      account {
+        data {
+          warehouses {
+            id
+            legacy_id
+            identifier
+            company_name
+            company_alias
+          }
+        }
+      }
+    }
+  `);
+
+  const warehouses = data.account.data.warehouses ?? [];
+  const map = {} as Record<WarehouseKey, string>;
   for (const { key, name } of WAREHOUSES) {
-    if (candidates.includes(name)) return key;
+    const match = warehouses.find((w) => warehouseMatchesName(w, name));
+    if (match) map[key] = match.id;
+  }
+
+  const missing = WAREHOUSES.filter((w) => !map[w.key]);
+  if (missing.length > 0) {
+    const found =
+      warehouses
+        .map(
+          (w) =>
+            `[id=${w.id} identifier="${w.identifier}" company_name="${w.company_name}" company_alias="${w.company_alias}"]`,
+        )
+        .join("; ") || "no warehouses returned";
+    throw new Error(
+      `Could not match warehouse name(s): ${missing
+        .map((m) => `"${m.name}"`)
+        .join(", ")}. ShipHero returned: ${found}. Update WAREHOUSES in lib/config.ts to match.`,
+    );
+  }
+
+  warehouseIdMemo = map;
+  if (isKvConfigured()) {
+    await kvSet(KV_KEYS.shipheroWarehouses, map, { ttlSeconds: 7 * 24 * 60 * 60 });
+  }
+  return map;
+}
+
+function keyForWarehouseId(
+  ids: Record<WarehouseKey, string>,
+  id: string | null,
+): WarehouseKey | null {
+  if (!id) return null;
+  for (const key of Object.keys(ids) as WarehouseKey[]) {
+    if (ids[key] === id) return key;
   }
   return null;
 }
 
-function warehouseNameFor(key: WarehouseKey): string {
-  return WAREHOUSES.find((w) => w.key === key)!.name;
-}
+// ===========================================================================
+// Inventory: stock per SKU per warehouse (+ best-effort lots)
+// ===========================================================================
 
-interface ProductsPage {
-  products: {
+interface WarehouseProductsPage {
+  warehouse_products: {
     data: {
       edges: Array<{
-        cursor: string;
         node: {
-          sku: string | null;
+          on_hand: number | null;
+          product: { sku: string | null; name: string | null } | null;
+        };
+      }>;
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    };
+  };
+}
+
+type SkuEntry = {
+  sku: string;
+  productName: string | null;
+  onHand: { nv: number; pa: number };
+  lots: Lot[];
+};
+
+export async function getShipHeroInventory(): Promise<InventoryResult> {
+  const warnings: string[] = [];
+  const ids = await resolveWarehouseIds();
+  const skuMap = new Map<string, SkuEntry>();
+
+  // Stock: one paginated warehouse_products query per warehouse.
+  for (const { key } of WAREHOUSES) {
+    let cursor: string | null = null;
+    do {
+      const data: WarehouseProductsPage = await shipheroGraphQL<WarehouseProductsPage>(
+        /* GraphQL */ `
+          query Stock($cursor: String, $warehouseId: String!) {
+            warehouse_products(warehouse_id: $warehouseId) {
+              data(first: 100, after: $cursor) {
+                edges {
+                  node {
+                    on_hand
+                    product {
+                      sku
+                      name
+                    }
+                  }
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+          }
+        `,
+        { cursor, warehouseId: ids[key] },
+      );
+
+      for (const edge of data.warehouse_products.data.edges) {
+        const sku = edge.node.product?.sku;
+        if (!sku) continue;
+        const entry =
+          skuMap.get(sku) ??
+          ({
+            sku,
+            productName: edge.node.product?.name ?? null,
+            onHand: { nv: 0, pa: 0 },
+            lots: [],
+          } as SkuEntry);
+        entry.onHand[key] += edge.node.on_hand ?? 0;
+        if (!entry.productName) entry.productName = edge.node.product?.name ?? null;
+        skuMap.set(sku, entry);
+      }
+
+      cursor = data.warehouse_products.data.pageInfo.hasNextPage
+        ? data.warehouse_products.data.pageInfo.endCursor
+        : null;
+    } while (cursor);
+  }
+
+  // Lots: best-effort — never blocks stock.
+  try {
+    await attachLots(skuMap, ids);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[shiphero] lots failed:", msg);
+    warnings.push(`Lot detail: ${msg}`);
+  }
+
+  return { inventory: { skus: Array.from(skuMap.values()) }, warnings };
+}
+
+interface ExpirationLotsPage {
+  expiration_lots: {
+    data: {
+      edges: Array<{
+        node: {
           name: string | null;
-          warehouse_products: Array<{
-            warehouse_id: string;
-            on_hand: number | null;
-            warehouse: { identifier: string | null; profile: string | null } | null;
-          }> | null;
+          sku: string | null;
+          expires_at: string | null;
+          locations: {
+            edges: Array<{
+              node: { quantity: number | null; warehouse_id: string | null };
+            }>;
+          } | null;
         };
       }>;
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -381,39 +405,32 @@ interface ProductsPage {
 }
 
 /**
- * Stock per SKU per warehouse. Pulls the products connection and sums on_hand
- * into NV / PA, mapping each warehouse_product to a warehouse by its
- * identifier/profile name (no opaque IDs hardcoded).
+ * Attach lots per SKU/warehouse from `expiration_lots`. Each Lot nests its
+ * `locations`, and each location carries a warehouse_id + quantity we map to
+ * NV/PA. Isolated from stock so a schema difference here can't blank inventory.
  */
-async function realInventory(): Promise<ShipHeroInventory> {
-  const skuMap = new Map<
-    string,
-    {
-      sku: string;
-      productName: string | null;
-      onHand: { nv: number; pa: number };
-      lots: Lot[];
-    }
-  >();
-
+async function attachLots(
+  skuMap: Map<string, SkuEntry>,
+  ids: Record<WarehouseKey, string>,
+): Promise<void> {
   let cursor: string | null = null;
   do {
-    const data: ProductsPage = await shipheroGraphQL<ProductsPage>(
+    const data: ExpirationLotsPage = await shipheroGraphQL<ExpirationLotsPage>(
       /* GraphQL */ `
-        query Products($cursor: String) {
-          products(first: 100, after: $cursor) {
-            data {
+        query Lots($cursor: String) {
+          expiration_lots {
+            data(first: 100, after: $cursor) {
               edges {
-                cursor
                 node {
-                  sku
                   name
-                  warehouse_products {
-                    warehouse_id
-                    on_hand
-                    warehouse {
-                      identifier
-                      profile
+                  sku
+                  expires_at
+                  locations {
+                    edges {
+                      node {
+                        quantity
+                        warehouse_id
+                      }
                     }
                   }
                 }
@@ -429,118 +446,88 @@ async function realInventory(): Promise<ShipHeroInventory> {
       { cursor },
     );
 
-    for (const edge of data.products.data.edges) {
-      const node = edge.node;
-      if (!node.sku) continue;
-      const entry = skuMap.get(node.sku) ?? {
-        sku: node.sku,
-        productName: node.name ?? null,
-        onHand: { nv: 0, pa: 0 },
-        lots: [] as Lot[],
-      };
-      for (const wp of node.warehouse_products ?? []) {
-        const key = warehouseKeyByName(
-          wp.warehouse?.identifier ?? null,
-          wp.warehouse?.profile ?? null,
-        );
-        if (key) entry.onHand[key] += wp.on_hand ?? 0;
+    for (const edge of data.expiration_lots.data.edges) {
+      const lot = edge.node;
+      if (!lot.sku) continue;
+      const entry = skuMap.get(lot.sku);
+      if (!entry) continue;
+      for (const loc of lot.locations?.edges ?? []) {
+        const key = keyForWarehouseId(ids, loc.node.warehouse_id);
+        if (!key) continue;
+        entry.lots.push({
+          warehouseKey: key,
+          warehouseName: warehouseNameFor(key),
+          lotNumber: lot.name ?? "—",
+          quantity: loc.node.quantity ?? 0,
+          expirationDate: lot.expires_at ? lot.expires_at.slice(0, 10) : null,
+        });
       }
-      skuMap.set(node.sku, entry);
     }
 
-    cursor = data.products.data.pageInfo.hasNextPage
-      ? data.products.data.pageInfo.endCursor
+    cursor = data.expiration_lots.data.pageInfo.hasNextPage
+      ? data.expiration_lots.data.pageInfo.endCursor
       : null;
   } while (cursor);
-
-  // Lot detail is best-effort and isolated so it can never blank out stock.
-  try {
-    await attachLots(skuMap);
-  } catch (err) {
-    console.error("[shiphero] lot detail unavailable:", err);
-  }
-
-  return { skus: Array.from(skuMap.values()) };
 }
 
-/**
- * Attach lot detail (lot number, quantity, expiration) per SKU/warehouse.
- *
- * NOTE: ShipHero exposes lots via `expiration_lots` on warehouse Locations,
- * and the exact path is best confirmed by introspecting the live schema (the
- * API is self-documenting). Until that path is verified against this account's
- * schema, this is a no-op — stock and days-of-stock (the core metrics) work
- * without it, and the UI shows "No lot detail reported" gracefully. Wire the
- * confirmed query here; nothing else needs to change.
- */
-async function attachLots(
-  _skuMap: Map<
-    string,
-    {
-      sku: string;
-      productName: string | null;
-      onHand: { nv: number; pa: number };
-      lots: Lot[];
-    }
-  >,
-): Promise<void> {
-  // Intentionally left unwired pending live-schema confirmation. See note above.
-  void warehouseNameFor; // keep helper referenced for the future lots mapping
-  return;
-}
+// ===========================================================================
+// Summary: fulfilled today, holds, returns, receivals
+// ===========================================================================
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/**
- * Each summary metric is computed independently and degrades to a safe default
- * (logging the underlying error) so a single schema mismatch in, say, the
- * returns query can't blank the fulfilled-today or holds numbers.
- */
-async function realSummary(): Promise<ShipHeroSummary> {
-  const today = todayIso();
+function dayStart(dateIso: string): string {
+  return `${dateIso}T00:00:00`;
+}
 
-  const [fulfillAndHolds, returnsToday, newReceivalsToday] = await Promise.all([
-    safe(() => fetchFulfillmentAndHolds(today), {
-      ordersFulfilledToday: 0,
-      ordersOnHold: { total: 0, breakdown: emptyBreakdown() },
-    }),
-    safe(() => countReturnsToday(today), 0),
-    safe(() => countReceivalsToday(today), 0),
-  ]);
+export async function getShipHeroSummary(): Promise<SummaryResult> {
+  const today = todayIso();
+  const warnings: string[] = [];
+
+  const [ordersOnHold, ordersFulfilledToday, returnsToday, newReceivalsToday] =
+    await Promise.all([
+      safe(() => fetchOrdersOnHold(), { total: 0, breakdown: emptyBreakdown() }, "Orders on hold", warnings),
+      safe(() => countFulfilledToday(today), 0, "Orders fulfilled today", warnings),
+      safe(() => countReturnsToday(today), 0, "Returns today", warnings),
+      safe(() => countReceivalsToday(today), 0, "New receivals today", warnings),
+    ]);
 
   return {
-    ordersFulfilledToday: fulfillAndHolds.ordersFulfilledToday,
-    ordersOnHold: fulfillAndHolds.ordersOnHold,
-    returnsToday,
-    newReceivalsToday,
+    summary: { ordersFulfilledToday, ordersOnHold, returnsToday, newReceivalsToday },
+    warnings,
   };
 }
 
-async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+async function safe<T>(
+  fn: () => Promise<T>,
+  fallback: T,
+  label: string,
+  warnings: string[],
+): Promise<T> {
   try {
     return await fn();
   } catch (err) {
-    console.error("[shiphero] summary metric failed:", err);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[shiphero] ${label} failed:`, msg);
+    warnings.push(`${label}: ${msg}`);
     return fallback;
   }
 }
 
-interface OrdersPage {
+interface HoldsOrdersPage {
   orders: {
     data: {
       edges: Array<{
         node: {
-          fulfillment_status: string | null;
-          updated_at: string | null;
           holds: {
-            fraud_hold: boolean;
-            address_hold: boolean;
-            shipping_method_hold: boolean;
-            operator_hold: boolean;
-            payment_hold: boolean;
-            client_hold: boolean;
+            fraud_hold: boolean | null;
+            address_hold: boolean | null;
+            shipping_method_hold: boolean | null;
+            operator_hold: boolean | null;
+            payment_hold: boolean | null;
+            client_hold: boolean | null;
           } | null;
         };
       }>;
@@ -549,25 +536,23 @@ interface OrdersPage {
   };
 }
 
-async function fetchFulfillmentAndHolds(today: string): Promise<{
-  ordersFulfilledToday: number;
-  ordersOnHold: { total: number; breakdown: HoldsBreakdown };
+/** Current orders on hold: total (any hold true) + per-type breakdown. */
+async function fetchOrdersOnHold(): Promise<{
+  total: number;
+  breakdown: HoldsBreakdown;
 }> {
   const breakdown = emptyBreakdown();
-  let ordersOnHoldTotal = 0;
-  let ordersFulfilledToday = 0;
-
+  let total = 0;
   let cursor: string | null = null;
+
   do {
-    const data: OrdersPage = await shipheroGraphQL<OrdersPage>(
+    const data: HoldsOrdersPage = await shipheroGraphQL<HoldsOrdersPage>(
       /* GraphQL */ `
-        query Orders($cursor: String, $date: ISODateTime) {
-          orders(first: 100, after: $cursor, updated_from: $date) {
-            data {
+        query HeldOrders($cursor: String) {
+          orders(has_hold: true) {
+            data(first: 100, after: $cursor) {
               edges {
                 node {
-                  fulfillment_status
-                  updated_at
                   holds {
                     fraud_hold
                     address_hold
@@ -586,36 +571,27 @@ async function fetchFulfillmentAndHolds(today: string): Promise<{
           }
         }
       `,
-      { cursor, date: `${today}T00:00:00` },
+      { cursor },
     );
 
     for (const edge of data.orders.data.edges) {
-      const node = edge.node;
-      if (
-        node.fulfillment_status === "fulfilled" &&
-        node.updated_at?.slice(0, 10) === today
-      ) {
-        ordersFulfilledToday++;
-      }
-      const h = node.holds;
-      if (h) {
-        const anyHold =
-          h.fraud_hold ||
-          h.address_hold ||
-          h.shipping_method_hold ||
-          h.operator_hold ||
-          h.payment_hold ||
-          h.client_hold;
-        if (anyHold) {
-          ordersOnHoldTotal++;
-          if (h.fraud_hold) breakdown.fraud_hold++;
-          if (h.address_hold) breakdown.address_hold++;
-          if (h.shipping_method_hold) breakdown.shipping_method_hold++;
-          if (h.operator_hold) breakdown.operator_hold++;
-          if (h.payment_hold) breakdown.payment_hold++;
-          if (h.client_hold) breakdown.client_hold++;
-        }
-      }
+      const h = edge.node.holds;
+      if (!h) continue;
+      const any =
+        h.fraud_hold ||
+        h.address_hold ||
+        h.shipping_method_hold ||
+        h.operator_hold ||
+        h.payment_hold ||
+        h.client_hold;
+      if (!any) continue;
+      total++;
+      if (h.fraud_hold) breakdown.fraud_hold++;
+      if (h.address_hold) breakdown.address_hold++;
+      if (h.shipping_method_hold) breakdown.shipping_method_hold++;
+      if (h.operator_hold) breakdown.operator_hold++;
+      if (h.payment_hold) breakdown.payment_hold++;
+      if (h.client_hold) breakdown.client_hold++;
     }
 
     cursor = data.orders.data.pageInfo.hasNextPage
@@ -623,10 +599,49 @@ async function fetchFulfillmentAndHolds(today: string): Promise<{
       : null;
   } while (cursor);
 
-  return {
-    ordersFulfilledToday,
-    ordersOnHold: { total: ordersOnHoldTotal, breakdown },
+  return { total, breakdown };
+}
+
+interface IdOrdersPage {
+  orders: {
+    data: {
+      edges: Array<{ node: { id: string } }>;
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    };
   };
+}
+
+/** Orders fulfilled today: fulfillment_status "fulfilled", updated today. */
+async function countFulfilledToday(today: string): Promise<number> {
+  let count = 0;
+  let cursor: string | null = null;
+  do {
+    const data: IdOrdersPage = await shipheroGraphQL<IdOrdersPage>(
+      /* GraphQL */ `
+        query Fulfilled($cursor: String, $date: ISODateTime) {
+          orders(fulfillment_status: "fulfilled", updated_from: $date) {
+            data(first: 100, after: $cursor) {
+              edges {
+                node {
+                  id
+                }
+              }
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
+        }
+      `,
+      { cursor, date: dayStart(today) },
+    );
+    count += data.orders.data.edges.length;
+    cursor = data.orders.data.pageInfo.hasNextPage
+      ? data.orders.data.pageInfo.endCursor
+      : null;
+  } while (cursor);
+  return count;
 }
 
 interface ReturnsPage {
@@ -638,16 +653,16 @@ interface ReturnsPage {
   };
 }
 
-/** Returns received/processed today — a single event in ShipHero, so one number. */
+/** Returns received today (a single event in ShipHero). Counts return records. */
 async function countReturnsToday(today: string): Promise<number> {
-  let cursor: string | null = null;
   let count = 0;
+  let cursor: string | null = null;
   do {
     const data: ReturnsPage = await shipheroGraphQL<ReturnsPage>(
       /* GraphQL */ `
         query Returns($cursor: String, $date: ISODateTime) {
-          returns(first: 100, after: $cursor, created_from: $date) {
-            data {
+          returns(date_from: $date) {
+            data(first: 100, after: $cursor) {
               edges {
                 node {
                   created_at
@@ -661,10 +676,10 @@ async function countReturnsToday(today: string): Promise<number> {
           }
         }
       `,
-      { cursor, date: `${today}T00:00:00` },
+      { cursor, date: dayStart(today) },
     );
     for (const edge of data.returns.data.edges) {
-      if (edge.node.created_at?.slice(0, 10) === today) count++;
+      if ((edge.node.created_at ?? "").slice(0, 10) === today) count++;
     }
     cursor = data.returns.data.pageInfo.hasNextPage
       ? data.returns.data.pageInfo.endCursor
@@ -673,16 +688,16 @@ async function countReturnsToday(today: string): Promise<number> {
   return count;
 }
 
-interface PurchaseOrdersPage {
-  purchase_orders: {
+interface ReceivalsPage {
+  warehouse_products: {
     data: {
       edges: Array<{
         node: {
-          line_items: {
+          inbounds: {
             edges: Array<{
-              node: { quantity_received: number | null; updated_at: string | null };
+              node: { quantity_received: number | null };
             }>;
-          };
+          } | null;
         };
       }>;
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -690,51 +705,53 @@ interface PurchaseOrdersPage {
   };
 }
 
-/** New receivals today: PO line items whose received quantity moved today. */
+/**
+ * New receivals today: warehouse_products updated today whose nested inbounds
+ * show received quantity. Counted across both warehouses.
+ */
 async function countReceivalsToday(today: string): Promise<number> {
-  let cursor: string | null = null;
+  const ids = await resolveWarehouseIds();
   let count = 0;
-  do {
-    const data: PurchaseOrdersPage = await shipheroGraphQL<PurchaseOrdersPage>(
-      /* GraphQL */ `
-        query Receivals($cursor: String, $date: ISODateTime) {
-          purchase_orders(first: 100, after: $cursor, updated_from: $date) {
-            data {
-              edges {
-                node {
-                  line_items {
-                    edges {
-                      node {
-                        quantity_received
-                        updated_at
+
+  for (const { key } of WAREHOUSES) {
+    let cursor: string | null = null;
+    do {
+      const data: ReceivalsPage = await shipheroGraphQL<ReceivalsPage>(
+        /* GraphQL */ `
+          query Receivals($cursor: String, $warehouseId: String!, $date: ISODateTime) {
+            warehouse_products(warehouse_id: $warehouseId, updated_from: $date) {
+              data(first: 100, after: $cursor) {
+                edges {
+                  node {
+                    inbounds {
+                      edges {
+                        node {
+                          quantity_received
+                        }
                       }
                     }
                   }
                 }
-              }
-              pageInfo {
-                hasNextPage
-                endCursor
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
               }
             }
           }
-        }
-      `,
-      { cursor, date: `${today}T00:00:00` },
-    );
-    for (const po of data.purchase_orders.data.edges) {
-      for (const li of po.node.line_items.edges) {
-        if (
-          (li.node.quantity_received ?? 0) > 0 &&
-          li.node.updated_at?.slice(0, 10) === today
-        ) {
-          count++;
+        `,
+        { cursor, warehouseId: ids[key], date: dayStart(today) },
+      );
+      for (const edge of data.warehouse_products.data.edges) {
+        for (const inb of edge.node.inbounds?.edges ?? []) {
+          if ((inb.node.quantity_received ?? 0) > 0) count++;
         }
       }
-    }
-    cursor = data.purchase_orders.data.pageInfo.hasNextPage
-      ? data.purchase_orders.data.pageInfo.endCursor
-      : null;
-  } while (cursor);
+      cursor = data.warehouse_products.data.pageInfo.hasNextPage
+        ? data.warehouse_products.data.pageInfo.endCursor
+        : null;
+    } while (cursor);
+  }
+
   return count;
 }

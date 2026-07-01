@@ -9,6 +9,9 @@ import type { ShopifyStatus } from "@/lib/types";
 // Always render fresh on request; data freshness is governed by KV / fetch cache
 // inside the data layer, not by this page being statically cached.
 export const dynamic = "force-dynamic";
+// Live computation (ShipHero + Shopify) can take a little while on this store's
+// volume when KV isn't caching a snapshot; give it room rather than timing out.
+export const maxDuration = 60;
 
 function Banner({
   tone,
@@ -92,15 +95,22 @@ export default async function DashboardPage() {
       </header>
 
       <div className="mt-5 space-y-2">
-        {snapshot.shiphero.stubbed && (
-          <Banner tone="amber">
-            Showing sample ShipHero data — real credentials not yet connected.
-          </Banner>
-        )}
-        {!snapshot.shiphero.stubbed && snapshot.shiphero.status === "error" && (
+        {snapshot.shiphero.status === "error" && (
           <Banner tone="red">
             Couldn’t load ShipHero data
             {snapshot.shiphero.message ? `: ${snapshot.shiphero.message}` : ""}.
+          </Banner>
+        )}
+        {snapshot.shiphero.warnings && snapshot.shiphero.warnings.length > 0 && (
+          <Banner tone="amber">
+            Some ShipHero metrics couldn’t load:
+            <ul className="mt-1 list-disc pl-5">
+              {snapshot.shiphero.warnings.map((w, i) => (
+                <li key={i} className="break-words">
+                  {w}
+                </li>
+              ))}
+            </ul>
           </Banner>
         )}
         {shopifyBanner(snapshot.shopify.status, snapshot.shopify.message)}
@@ -123,9 +133,8 @@ export default async function DashboardPage() {
       </div>
 
       <footer className="mt-10 text-center text-xs text-slate-400">
-        Stock &amp; fulfillment from ShipHero
-        {snapshot.shiphero.stubbed ? " (sample data)" : ""} · sales velocity from
-        Shopify · aggregated by SKU.
+        Stock &amp; fulfillment from ShipHero · sales velocity from Shopify ·
+        aggregated by SKU.
       </footer>
     </main>
   );

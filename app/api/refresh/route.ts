@@ -63,7 +63,8 @@ async function handle(req: NextRequest) {
       generatedAt: snapshot.generatedAt,
       skuCount: snapshot.skus.length,
       shopifyStatus: snapshot.shopify.status,
-      shipheroStubbed: snapshot.shiphero.stubbed,
+      shipheroStatus: snapshot.shiphero.status,
+      shipheroWarnings: snapshot.shiphero.warnings ?? [],
     });
   } catch (err) {
     console.error("[refresh] failed:", err);

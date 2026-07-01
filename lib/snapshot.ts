@@ -1,21 +1,29 @@
 /**
- * Combines the Shopify (real) and ShipHero (stubbed) layers into the single
- * Snapshot object the dashboard renders, applying the metric formulas.
+ * Combines the Shopify and ShipHero layers into the single Snapshot object the
+ * dashboard renders, applying the metric formulas.
  *
  * Read path: the dashboard reads the latest snapshot from KV if present;
  * otherwise it calls computeSnapshot() directly (see app/page.tsx). /api/refresh
  * always recomputes and writes to KV.
+ *
+ * ShipHero and Shopify are pulled independently so one failing never blanks the
+ * other. ShipHero is the source of the SKU list, so on a core ShipHero error we
+ * still render (with a banner) rather than throwing. Shopify is guarded by a
+ * timeout: on this store's volume, computing 30 days fresh without KV can be
+ * slow, and we'd rather show stock with "—" days-of-stock than hang the page.
  */
 import { ROLLING_WINDOW_DAYS, KV_KEYS } from "./config";
 import { isKvConfigured, kvGet, kvSet } from "./kv";
-import { getShopifyData } from "./shopify";
-import { getShipHeroInventory, getShipHeroSummary, isShipHeroStubbed } from "./shiphero";
+import { getShopifyData, type ShopifyResult } from "./shopify";
+import { getShipHeroInventory, getShipHeroSummary } from "./shiphero";
 import type {
   Snapshot,
   SkuRow,
   ShipHeroInventory,
   ShipHeroSummary,
 } from "./types";
+
+const SHOPIFY_TIMEOUT_MS = 45_000;
 
 function emptyShipHeroSummary(): ShipHeroSummary {
   return {
@@ -36,15 +44,24 @@ function emptyShipHeroSummary(): ShipHeroSummary {
   };
 }
 
+function errMessage(e: unknown): string {
+  return e instanceof Error ? e.message : "Unknown error";
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((resolve) => setTimeout(() => resolve(onTimeout()), ms)),
+  ]);
+}
+
 /** Pull from both sources and compute every metric. */
 export async function computeSnapshot(): Promise<Snapshot> {
-  // ShipHero and Shopify are pulled independently so a failure in one never
-  // takes down the whole dashboard. ShipHero is the source of the SKU list, so
-  // when it errors we still render (with a banner) rather than throwing.
   let inventory: ShipHeroInventory = { skus: [] };
   let summary: ShipHeroSummary = emptyShipHeroSummary();
   let shipheroStatus: "ok" | "error" = "ok";
   let shipheroMessage: string | undefined;
+  const warnings: string[] = [];
 
   const [inventoryResult, summaryResult, shopify] = await Promise.all([
     getShipHeroInventory().then(
@@ -55,26 +72,28 @@ export async function computeSnapshot(): Promise<Snapshot> {
       (v) => ({ ok: true as const, v }),
       (e) => ({ ok: false as const, e }),
     ),
-    getShopifyData(),
+    withTimeout<ShopifyResult>(getShopifyData(), SHOPIFY_TIMEOUT_MS, () => ({
+      status: "error",
+      message:
+        "Shopify sales query timed out. Connect Vercel KV to enable the fast backfill/daily-sync model for this store's volume.",
+      salesBySku: null,
+      ordersCreatedToday: null,
+    })),
   ]);
 
   if (inventoryResult.ok) {
-    inventory = inventoryResult.v;
+    inventory = inventoryResult.v.inventory;
+    warnings.push(...inventoryResult.v.warnings);
   } else {
     shipheroStatus = "error";
-    shipheroMessage =
-      inventoryResult.e instanceof Error
-        ? inventoryResult.e.message
-        : "Unknown ShipHero error";
+    shipheroMessage = errMessage(inventoryResult.e);
   }
+
   if (summaryResult.ok) {
-    summary = summaryResult.v;
-  } else if (shipheroStatus === "ok") {
-    shipheroStatus = "error";
-    shipheroMessage =
-      summaryResult.e instanceof Error
-        ? summaryResult.e.message
-        : "Unknown ShipHero error";
+    summary = summaryResult.v.summary;
+    warnings.push(...summaryResult.v.warnings);
+  } else {
+    warnings.push(`Daily summary: ${errMessage(summaryResult.e)}`);
   }
 
   const sales = shopify.salesBySku;
@@ -83,7 +102,7 @@ export async function computeSnapshot(): Promise<Snapshot> {
     const total = item.onHand.nv + item.onHand.pa;
 
     // units30 is null when we have no Shopify data at all (no token / backfill
-    // in progress / error). A SKU simply absent from the sales map means 0.
+    // in progress / error / timeout). A SKU simply absent from the map means 0.
     const units30 = sales ? sales[item.sku] ?? 0 : null;
     const dailyVelocity = units30 === null ? null : units30 / ROLLING_WINDOW_DAYS;
 
@@ -125,9 +144,9 @@ export async function computeSnapshot(): Promise<Snapshot> {
       ordersCreatedTodayShopify: shopify.ordersCreatedToday,
     },
     shiphero: {
-      stubbed: isShipHeroStubbed(),
       status: shipheroStatus,
       message: shipheroMessage,
+      warnings: warnings.length > 0 ? warnings : undefined,
     },
     shopify: { status: shopify.status, message: shopify.message },
   };

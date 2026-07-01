@@ -71,12 +71,15 @@ export interface Snapshot {
   skus: SkuRow[];
   summary: DailySummary;
   shiphero: {
-    /** True when running on placeholder data because no refresh token is set. */
-    stubbed: boolean;
-    /** "ok" normally; "error" when the live ShipHero API call failed. */
+    /** "ok" when inventory loaded; "error" when the core ShipHero call failed. */
     status: "ok" | "error";
     /** Underlying error detail when status is "error" (shown in a banner). */
     message?: string;
+    /**
+     * Non-fatal, per-metric problems (e.g. a summary query that failed) so the
+     * dashboard can still render the metrics that did load and flag the rest.
+     */
+    warnings?: string[];
   };
   shopify: {
     status: ShopifyStatus;
