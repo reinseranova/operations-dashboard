@@ -67,6 +67,20 @@ function warehouseNameFor(key: WarehouseKey): string {
   return WAREHOUSES.find((w) => w.key === key)!.name;
 }
 
+// Soft time budget (epoch ms) for the whole ShipHero pull. Pagination loops stop
+// past it and the client won't sleep for credits beyond it, so /api/refresh
+// always returns within Vercel's function limit and stores a (possibly partial)
+// snapshot rather than 504-ing. Set per compute by computeSnapshot.
+let shipheroDeadline = Infinity;
+
+export function setShipHeroDeadline(epochMs: number): void {
+  shipheroDeadline = epochMs;
+}
+
+function budgetLeft(): boolean {
+  return Date.now() < shipheroDeadline;
+}
+
 // ===========================================================================
 // Auth: refresh-token → access-token, cached (KV when available, else memory)
 // ===========================================================================
@@ -175,6 +189,10 @@ async function shipheroGraphQL<T>(
       const waitMs = secs
         ? Math.min(Number(secs) * 1000 + 500, 20000)
         : Math.min(1000 * 2 ** attempt, 16000);
+      // Don't sleep past the overall budget — bail so the caller can return.
+      if (Date.now() + waitMs > shipheroDeadline) {
+        throw new Error("ShipHero time budget exceeded waiting for credits.");
+      }
       await sleep(waitMs);
       continue;
     }
@@ -315,8 +333,8 @@ interface WarehouseProductsPage {
     data: {
       edges: Array<{
         node: {
+          sku: string | null;
           on_hand: number | null;
-          product: { sku: string | null; name: string | null } | null;
         };
       }>;
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -352,11 +370,8 @@ export async function getShipHeroInventory(): Promise<InventoryResult> {
                     data(first: 100, after: $cursor) {
                       edges {
                         node {
+                          sku
                           on_hand
-                          product {
-                            sku
-                            name
-                          }
                         }
                       }
                       pageInfo {
@@ -371,25 +386,24 @@ export async function getShipHeroInventory(): Promise<InventoryResult> {
             );
 
           for (const edge of data.warehouse_products.data.edges) {
-            const sku = edge.node.product?.sku;
+            const sku = edge.node.sku;
             if (!sku) continue;
             const entry =
               skuMap.get(sku) ??
               ({
                 sku,
-                productName: edge.node.product?.name ?? null,
+                productName: null,
                 onHand: { nv: 0, pa: 0 },
                 lots: [],
               } as SkuEntry);
             entry.onHand[key] += edge.node.on_hand ?? 0;
-            if (!entry.productName) entry.productName = edge.node.product?.name ?? null;
             skuMap.set(sku, entry);
           }
 
           cursor = data.warehouse_products.data.pageInfo.hasNextPage
             ? data.warehouse_products.data.pageInfo.endCursor
             : null;
-        } while (cursor);
+        } while (cursor && budgetLeft());
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[shiphero] stock for warehouse ${warehouseId} failed:`, msg);
@@ -402,6 +416,12 @@ export async function getShipHeroInventory(): Promise<InventoryResult> {
   // dashboard shows the red banner rather than an empty (misleading) table.
   if (skuMap.size === 0 && warnings.length > 0) {
     throw new Error(warnings.join(" | "));
+  }
+
+  if (!budgetLeft()) {
+    warnings.push(
+      "Stock: stopped early (time budget) — some SKUs may be missing; the next refresh continues.",
+    );
   }
 
   // Lots: best-effort — never blocks stock.
@@ -499,7 +519,7 @@ async function attachLots(
     cursor = data.expiration_lots.data.pageInfo.hasNextPage
       ? data.expiration_lots.data.pageInfo.endCursor
       : null;
-  } while (cursor);
+  } while (cursor && budgetLeft());
 }
 
 // ===========================================================================
@@ -643,7 +663,7 @@ async function fetchOrdersOnHold(): Promise<{
     cursor = data.orders.data.pageInfo.hasNextPage
       ? data.orders.data.pageInfo.endCursor
       : null;
-  } while (cursor);
+  } while (cursor && budgetLeft());
 
   return { total, breakdown };
 }
@@ -686,7 +706,7 @@ async function countFulfilledToday(today: string): Promise<number> {
     cursor = data.orders.data.pageInfo.hasNextPage
       ? data.orders.data.pageInfo.endCursor
       : null;
-  } while (cursor);
+  } while (cursor && budgetLeft());
   return count;
 }
 
@@ -730,7 +750,7 @@ async function countReturnsToday(today: string): Promise<number> {
     cursor = data.returns.data.pageInfo.hasNextPage
       ? data.returns.data.pageInfo.endCursor
       : null;
-  } while (cursor);
+  } while (cursor && budgetLeft());
   return count;
 }
 
@@ -797,7 +817,7 @@ async function countReceivalsToday(today: string): Promise<number> {
       cursor = data.warehouse_products.data.pageInfo.hasNextPage
         ? data.warehouse_products.data.pageInfo.endCursor
         : null;
-    } while (cursor);
+    } while (cursor && budgetLeft());
   }
 
   return count;

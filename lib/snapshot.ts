@@ -15,7 +15,11 @@
 import { ROLLING_WINDOW_DAYS, KV_KEYS } from "./config";
 import { isKvConfigured, kvGet, kvSet } from "./kv";
 import { getShopifyData, type ShopifyResult } from "./shopify";
-import { getShipHeroInventory, getShipHeroSummary } from "./shiphero";
+import {
+  getShipHeroInventory,
+  getShipHeroSummary,
+  setShipHeroDeadline,
+} from "./shiphero";
 import type {
   Snapshot,
   SkuRow,
@@ -24,6 +28,9 @@ import type {
 } from "./types";
 
 const SHOPIFY_TIMEOUT_MS = 45_000;
+// ShipHero pull budget — keeps the whole compute under Vercel's 60s limit so
+// /api/refresh stores a snapshot instead of timing out.
+const SHIPHERO_BUDGET_MS = 45_000;
 
 function emptyShipHeroSummary(): ShipHeroSummary {
   return {
@@ -63,23 +70,32 @@ export async function computeSnapshot(): Promise<Snapshot> {
   let shipheroMessage: string | undefined;
   const warnings: string[] = [];
 
-  const [inventoryResult, summaryResult, shopify] = await Promise.all([
-    getShipHeroInventory().then(
-      (v) => ({ ok: true as const, v }),
-      (e) => ({ ok: false as const, e }),
-    ),
-    getShipHeroSummary().then(
-      (v) => ({ ok: true as const, v }),
-      (e) => ({ ok: false as const, e }),
-    ),
-    withTimeout<ShopifyResult>(getShopifyData(), SHOPIFY_TIMEOUT_MS, () => ({
+  setShipHeroDeadline(Date.now() + SHIPHERO_BUDGET_MS);
+
+  // Shopify runs concurrently (it's fast with KV, or fails fast on a bad token).
+  // ShipHero inventory is awaited BEFORE the summary so stock — the core of the
+  // dashboard — always gets first claim on the shared time/credit budget.
+  const shopifyPromise = withTimeout<ShopifyResult>(
+    getShopifyData(),
+    SHOPIFY_TIMEOUT_MS,
+    () => ({
       status: "error",
       message:
         "Shopify sales query timed out. Connect Vercel KV to enable the fast backfill/daily-sync model for this store's volume.",
       salesBySku: null,
       ordersCreatedToday: null,
-    })),
-  ]);
+    }),
+  );
+
+  const inventoryResult = await getShipHeroInventory().then(
+    (v) => ({ ok: true as const, v }),
+    (e) => ({ ok: false as const, e }),
+  );
+  const summaryResult = await getShipHeroSummary().then(
+    (v) => ({ ok: true as const, v }),
+    (e) => ({ ok: false as const, e }),
+  );
+  const shopify = await shopifyPromise;
 
   if (inventoryResult.ok) {
     inventory = inventoryResult.v.inventory;
