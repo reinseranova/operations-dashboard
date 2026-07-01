@@ -18,6 +18,7 @@ import {
   PRODUCT_NAMES,
   getShopifyData,
   isNonInventorySku,
+  resolveCanonicalSku,
   type ShopifyResult,
 } from "./shopify";
 import {
@@ -56,6 +57,34 @@ function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => T): Promise<
     p,
     new Promise<T>((resolve) => setTimeout(() => resolve(onTimeout()), ms)),
   ]);
+}
+
+type InventoryItem = ShipHeroInventory["skus"][number];
+
+/**
+ * Merge ShipHero rows for a deprecated/alias SKU into its canonical SKU's
+ * row (summed stock, combined lots) so the same physical product doesn't
+ * show up twice under two different codes.
+ */
+function mergeAliasedSkus(items: InventoryItem[]): InventoryItem[] {
+  const merged = new Map<string, InventoryItem>();
+  for (const item of items) {
+    const canonical = resolveCanonicalSku(item.sku);
+    const existing = merged.get(canonical);
+    if (existing) {
+      existing.onHand.nv += item.onHand.nv;
+      existing.onHand.pa += item.onHand.pa;
+      existing.lots.push(...item.lots);
+    } else {
+      merged.set(canonical, {
+        ...item,
+        sku: canonical,
+        onHand: { ...item.onHand },
+        lots: [...item.lots],
+      });
+    }
+  }
+  return Array.from(merged.values());
 }
 
 /** Pull from both sources and compute every metric. */
@@ -110,7 +139,7 @@ export async function computeSnapshot(): Promise<Snapshot> {
 
   const sales = shopify.salesBySku;
 
-  const skus: SkuRow[] = inventory.skus
+  const skus: SkuRow[] = mergeAliasedSkus(inventory.skus)
     .filter((item) => !isNonInventorySku(item.sku))
     .map((item) => {
       const total = item.onHand.nv + item.onHand.pa;
@@ -134,7 +163,9 @@ export async function computeSnapshot(): Promise<Snapshot> {
         daysOfStock,
         lots: item.lots,
       };
-    });
+    })
+    // Nothing left to fulfil from — hide SKUs with no physical stock at all.
+    .filter((row) => row.stock.total > 0);
 
   // Highest total stock first, lowest last. No UI sort controls — always this order.
   skus.sort((a, b) => b.stock.total - a.stock.total);

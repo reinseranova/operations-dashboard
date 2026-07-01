@@ -73,12 +73,22 @@ export const PRODUCT_NAMES: Record<string, string> = {
   "SERA-LIP-SERUM-8ML": "Lip Rejuvenation Serum",
   "SERA-SPF- 50ML": "SPF Liquid Serum", // note trailing space in SKU
 
+  // Dark Spot MIS
+  "SERA-MIS-DARK-SPOT-1MONTH": "1 Month Dark Spot MIS",
+  "SERA-MIS-DARK-SPOT-2MONTH": "2 Month Dark Spot MIS",
+  "SERA-MIS-DARK-SPOT-3MONTH": "3 Month Dark Spot MIS",
+
+  // Other MIS
+  "SERA-MIS-LIP-1MONTH": "1 month Lip MIS",
+  "SERA-MIS-ACNE-1MONTH": "1 Month Acne Scar MIS",
+  "SERA-MIS-ACNE-2MONTH": "2 Month Acne Scar MIS",
+
+  // Retinal Serum
+  "SERA-RETI-SERUM-30ML": "1 Month Supply Retinal Serum",
+
   // Freebies (shown in table but flagged)
   "SERA-MASK-COL-1POUCH": "Collagen Mask 1 Pouch (Freebie)",
   "DPCD9-WM304001-1POUCH": "MIS Patches 1 Pouch (Freebie)",
-
-  // Deprecated (should not appear, but named for clarity if they do)
-  "DPCD9-WM293001": "Old Collagen Cream (Deprecated)",
 };
 
 // SKUs to exclude from the inventory table entirely — digital products,
@@ -87,7 +97,7 @@ export const EXCLUDED_SKUS = new Set([
   "ECR-001", // digital product — not physically stocked
   "SN-TY-CARD",
   "DPCD9-WM227001-FBM",
-  "DPCD9-WM178001-FBM",
+  "DPCD9-WM178001 FBM", // note: space, not a hyphen, before FBM
 ]);
 
 // Maps Shopify bundle SKU → component SKUs and quantities consumed per sale.
@@ -161,6 +171,10 @@ export const BUNDLE_MAP: Record<string, { sku: string; qty: number }[]> = {
   "SERA-COL-CREAM-50G-12PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 12 }],
   // Alternate bundle SKU (numeric barcode-style ID) for the same 2-pack.
   "47805724786939": [{ sku: "SERA-COL-CREAM-50G", qty: 2 }],
+  // Multi-packs still listed under the deprecated collagen cream SKU.
+  "DPCD9-WM293001-2PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 2 }],
+  "DPCD9-WM293001-3PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 3 }],
+  "DPCD9-WM293001-6PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 6 }],
 
   // ── Multi-Unit Bundles — Collagen Cleanser ────────────────────────────
   "SERA-COL-CLEANSER-75ML-2MONTH": [{ sku: "SERA-COL-CLEANSER-75ML", qty: 2 }],
@@ -210,6 +224,12 @@ export const BUNDLE_MAP: Record<string, { sku: string; qty: number }[]> = {
   "SERA-SPF- 50ML-2MONTH": [{ sku: "SERA-SPF- 50ML", qty: 2 }],
   "SERA-SPF- 50ML-3MONTH": [{ sku: "SERA-SPF- 50ML", qty: 3 }],
   "SERA-SPF- 50ML-6MONTH": [{ sku: "SERA-SPF- 50ML", qty: 6 }],
+
+  // ── Ship-together combo (not a real stocked product) ──────────────────
+  "DPCD9-WM274001+DPCD9-WM273001": [
+    { sku: "DPCD9-WM274001", qty: 1 },
+    { sku: "DPCD9-WM273001", qty: 1 },
+  ],
 };
 
 // Deprecated and alias SKUs: when seen in Shopify orders, normalise to the
@@ -228,7 +248,7 @@ export const FREEBIE_SKUS = new Set([
 // Bump whenever BUNDLE_MAP/SKU_ALIASES/FREEBIE_SKUS change shape — see
 // invalidateForBundleMapVersion() below, which busts stale per-day KV entries
 // computed under the old (non-expanded) rules.
-const CURRENT_BUNDLE_MAP_VERSION = 1;
+const CURRENT_BUNDLE_MAP_VERSION = 2;
 
 function normalizeSkuKey(sku: string): string {
   return sku.trim().toUpperCase();
@@ -248,6 +268,33 @@ export function isNonInventorySku(sku: string): boolean {
   return NON_INVENTORY_SKU_KEYS.has(normalizeSkuKey(sku));
 }
 
+// Case/whitespace-insensitive lookup tables for the maps above — Shopify and
+// ShipHero don't always agree on SKU casing (see ECR-001 vs ecr-001), and a
+// silent miss here means a bundle's sales get counted as if it were a plain
+// component instead of being expanded.
+const BUNDLE_MAP_BY_KEY = new Map(
+  Object.entries(BUNDLE_MAP).map(([sku, components]) => [
+    normalizeSkuKey(sku),
+    components,
+  ]),
+);
+const SKU_ALIASES_BY_KEY = new Map(
+  Object.entries(SKU_ALIASES).map(([sku, canonical]) => [
+    normalizeSkuKey(sku),
+    canonical,
+  ]),
+);
+const FREEBIE_SKU_KEYS = new Set([...FREEBIE_SKUS].map(normalizeSkuKey));
+
+/**
+ * Resolve a deprecated/alias SKU to its canonical SKU (case/whitespace
+ * insensitive). Used both for sales aggregation and for merging ShipHero
+ * inventory rows that represent the same physical product under two codes.
+ */
+export function resolveCanonicalSku(sku: string): string {
+  return SKU_ALIASES_BY_KEY.get(normalizeSkuKey(sku)) ?? sku;
+}
+
 /**
  * Expand one order line item into its component SKU(s), mutating `acc`
  * (SKU → units). Normalises aliases first, drops freebies, and expands
@@ -255,11 +302,11 @@ export function isNonInventorySku(sku: string): boolean {
  * a direct component sale.
  */
 function expandLineItem(sku: string, qty: number, acc: SalesMap): void {
-  const canonical = SKU_ALIASES[sku] ?? sku;
+  const canonical = resolveCanonicalSku(sku);
 
-  if (FREEBIE_SKUS.has(canonical)) return;
+  if (FREEBIE_SKU_KEYS.has(normalizeSkuKey(canonical))) return;
 
-  const components = BUNDLE_MAP[canonical];
+  const components = BUNDLE_MAP_BY_KEY.get(normalizeSkuKey(canonical));
   if (components) {
     for (const { sku: compSku, qty: compQty } of components) {
       acc[compSku] = (acc[compSku] ?? 0) + qty * compQty;
