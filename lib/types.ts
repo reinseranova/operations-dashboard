@@ -9,8 +9,6 @@ export interface Lot {
   quantity: number;
   /** ISO date (YYYY-MM-DD) or null when the lot has no expiration. */
   expirationDate: string | null;
-  /** Bin/shelf label, for display only. */
-  location: string | null;
 }
 
 /** Per-warehouse on-hand stock for a SKU. */

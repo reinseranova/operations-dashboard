@@ -436,7 +436,6 @@ interface LotsPage {
                   name: string | null;
                   expires_at: string | null;
                 } | null;
-                location: { name: string | null } | null;
               };
             }>;
           } | null;
@@ -448,17 +447,34 @@ interface LotsPage {
 }
 
 /**
- * Attach per-bin lot detail to each SKU, keyed by warehouse.
+ * Attach lot detail to each SKU, keyed by warehouse + lot number.
  *
  * Uses `warehouse_products(warehouse_id).locations` (ItemLocation), whose
- * `quantity` field is on ItemLocation, not the nested `Location`. A location
- * with stock but no lot assigned still shows a row with `lotNumber: null`
- * rather than being dropped.
+ * `quantity` field is on ItemLocation, not the nested `Location`. The same
+ * lot is typically split across several bins, which isn't useful to show
+ * separately — quantities for the same (warehouse, lot number) are summed
+ * into a single row. Bins with stock but no lot assigned are grouped the
+ * same way under `lotNumber: null` rather than being dropped.
  */
 async function attachLots(
   skuMap: Map<string, SkuEntry>,
   ids: WarehouseIdMap,
 ): Promise<void> {
+  // sku -> "warehouseKey|lotNumber" -> accumulated Lot
+  const grouped = new Map<string, Map<string, Lot>>();
+
+  const addLot = (sku: string, lot: Lot) => {
+    const bySku = grouped.get(sku) ?? new Map<string, Lot>();
+    const groupKey = `${lot.warehouseKey}|${lot.lotNumber ?? ""}`;
+    const existing = bySku.get(groupKey);
+    if (existing) {
+      existing.quantity += lot.quantity;
+    } else {
+      bySku.set(groupKey, lot);
+    }
+    grouped.set(sku, bySku);
+  };
+
   for (const { key } of WAREHOUSES) {
     for (const warehouseId of ids[key]) {
       let cursor: string | null = null;
@@ -479,9 +495,6 @@ async function attachLots(
                               name
                               expires_at
                             }
-                            location {
-                              name
-                            }
                           }
                         }
                       }
@@ -500,20 +513,18 @@ async function attachLots(
 
         for (const edge of data.warehouse_products.data.edges) {
           const sku = edge.node.sku;
-          const entry = sku ? skuMap.get(sku) : undefined;
-          if (!entry) continue;
+          if (!sku || !skuMap.has(sku)) continue;
 
           for (const locEdge of edge.node.locations?.edges ?? []) {
             const quantity = locEdge.node.quantity ?? 0;
             if (quantity <= 0) continue;
             const lot = locEdge.node.expiration_lot;
-            entry.lots.push({
+            addLot(sku, {
               warehouseKey: key,
               warehouseName: warehouseNameFor(key),
               lotNumber: lot?.name ?? null,
               quantity,
               expirationDate: lot?.expires_at ? lot.expires_at.slice(0, 10) : null,
-              location: locEdge.node.location?.name ?? null,
             });
           }
         }
@@ -523,6 +534,11 @@ async function attachLots(
           : null;
       } while (cursor && budgetLeft());
     }
+  }
+
+  for (const [sku, bySku] of grouped) {
+    const entry = skuMap.get(sku);
+    if (entry) entry.lots = Array.from(bySku.values());
   }
 }
 

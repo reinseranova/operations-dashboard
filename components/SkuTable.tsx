@@ -42,7 +42,6 @@ function LotDetail({ row }: { row: SkuRow }) {
         <thead>
           <tr className="text-left text-xs uppercase tracking-wide text-slate-400">
             <th className="py-1 pr-4 font-medium">Warehouse</th>
-            <th className="py-1 pr-4 font-medium">Location</th>
             <th className="py-1 pr-4 font-medium">Lot #</th>
             <th className="py-1 pr-4 font-medium">Qty</th>
             <th className="py-1 pr-4 font-medium">Expiration</th>
@@ -50,12 +49,9 @@ function LotDetail({ row }: { row: SkuRow }) {
         </thead>
         <tbody>
           {row.lots.map((lot, i) => (
-            <tr key={`${lot.lotNumber ?? "no-lot"}-${lot.location ?? "no-loc"}-${lot.warehouseKey}-${i}`} className="border-t border-slate-100">
+            <tr key={`${lot.lotNumber ?? "no-lot"}-${lot.warehouseKey}-${i}`} className="border-t border-slate-100">
               <td className="py-1.5 pr-4 uppercase text-slate-600">
                 {lot.warehouseKey}
-              </td>
-              <td className="py-1.5 pr-4 text-slate-600">
-                {lot.location ?? <span className="text-slate-400">—</span>}
               </td>
               <td className="py-1.5 pr-4 font-mono text-slate-800">
                 {lot.lotNumber ?? <span className="text-slate-400">no lot</span>}

@@ -85,6 +85,9 @@ export const PRODUCT_NAMES: Record<string, string> = {
 // internal placeholders, etc. that are not physically stocked.
 export const EXCLUDED_SKUS = new Set([
   "ECR-001", // digital product — not physically stocked
+  "SN-TY-CARD",
+  "DPCD9-WM227001-FBM",
+  "DPCD9-WM178001-FBM",
 ]);
 
 // Maps Shopify bundle SKU → component SKUs and quantities consumed per sale.
@@ -156,6 +159,8 @@ export const BUNDLE_MAP: Record<string, { sku: string; qty: number }[]> = {
   "SERA-COL-CREAM-50G-3PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 3 }],
   "SERA-COL-CREAM-50G-6PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 6 }],
   "SERA-COL-CREAM-50G-12PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 12 }],
+  // Alternate bundle SKU (numeric barcode-style ID) for the same 2-pack.
+  "47805724786939": [{ sku: "SERA-COL-CREAM-50G", qty: 2 }],
 
   // ── Multi-Unit Bundles — Collagen Cleanser ────────────────────────────
   "SERA-COL-CLEANSER-75ML-2MONTH": [{ sku: "SERA-COL-CLEANSER-75ML", qty: 2 }],
@@ -164,6 +169,8 @@ export const BUNDLE_MAP: Record<string, { sku: string; qty: number }[]> = {
   // ── Multi-Unit Bundles — Anti Aging MIS ──────────────────────────────
   "DPCD9-WM274001-2PCS": [{ sku: "DPCD9-WM274001", qty: 2 }],
   "DPCD9-WM274001-4PCS": [{ sku: "DPCD9-WM274001", qty: 4 }],
+  // Alternate bundle SKU (single unit) for the 3-month MIS.
+  "KU-AH5W-IZ83": [{ sku: "DPCD9-WM274001", qty: 1 }],
 
   // ── Multi-Unit Bundles — MIS Patches ─────────────────────────────────
   "DPCD9-WM304001-2PCS": [{ sku: "DPCD9-WM304001", qty: 2 }],
@@ -222,6 +229,24 @@ export const FREEBIE_SKUS = new Set([
 // invalidateForBundleMapVersion() below, which busts stale per-day KV entries
 // computed under the old (non-expanded) rules.
 const CURRENT_BUNDLE_MAP_VERSION = 1;
+
+function normalizeSkuKey(sku: string): string {
+  return sku.trim().toUpperCase();
+}
+
+// SKUs that must never show up as a row in the physical inventory table:
+// explicitly excluded SKUs, plus every bundle SKU. Bundles are virtual —
+// ShipHero sometimes tracks them as their own (derived) SKU record, but they
+// don't represent real stock and would double-count the components they're
+// made of. Matched case-insensitively since ShipHero and Shopify don't
+// always agree on SKU casing.
+const NON_INVENTORY_SKU_KEYS = new Set(
+  [...EXCLUDED_SKUS, ...Object.keys(BUNDLE_MAP)].map(normalizeSkuKey),
+);
+
+export function isNonInventorySku(sku: string): boolean {
+  return NON_INVENTORY_SKU_KEYS.has(normalizeSkuKey(sku));
+}
 
 /**
  * Expand one order line item into its component SKU(s), mutating `acc`

@@ -15,9 +15,9 @@
 import { ROLLING_WINDOW_DAYS, KV_KEYS } from "./config";
 import { isKvConfigured, kvGet, kvSet } from "./kv";
 import {
-  EXCLUDED_SKUS,
   PRODUCT_NAMES,
   getShopifyData,
+  isNonInventorySku,
   type ShopifyResult,
 } from "./shopify";
 import {
@@ -111,7 +111,7 @@ export async function computeSnapshot(): Promise<Snapshot> {
   const sales = shopify.salesBySku;
 
   const skus: SkuRow[] = inventory.skus
-    .filter((item) => !EXCLUDED_SKUS.has(item.sku))
+    .filter((item) => !isNonInventorySku(item.sku))
     .map((item) => {
       const total = item.onHand.nv + item.onHand.pa;
 
