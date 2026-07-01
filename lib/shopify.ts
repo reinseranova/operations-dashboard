@@ -98,6 +98,10 @@ export const EXCLUDED_SKUS = new Set([
   "SN-TY-CARD",
   "DPCD9-WM227001-FBM",
   "DPCD9-WM178001 FBM", // note: space, not a hyphen, before FBM
+  "48166093652219",
+  "48678418481403",
+  "48166202999035",
+  "48678420644091",
 ]);
 
 // Maps Shopify bundle SKU → component SKUs and quantities consumed per sale.

@@ -62,29 +62,27 @@ function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => T): Promise<
 type InventoryItem = ShipHeroInventory["skus"][number];
 
 /**
- * Merge ShipHero rows for a deprecated/alias SKU into its canonical SKU's
- * row (summed stock, combined lots) so the same physical product doesn't
- * show up twice under two different codes.
+ * Collapse ShipHero rows for a deprecated/alias SKU onto its canonical SKU's
+ * row so the same physical product doesn't show up twice under two codes.
+ *
+ * Quantities are NOT summed across the two SKU codes — ShipHero sometimes
+ * tracks the exact same physical stock under both, so adding them together
+ * double-counts it. Instead we keep only one row per canonical SKU: the
+ * canonical SKU's own record when ShipHero has one, otherwise whichever
+ * alias record we saw (there's normally just one).
  */
 function mergeAliasedSkus(items: InventoryItem[]): InventoryItem[] {
-  const merged = new Map<string, InventoryItem>();
+  const byCanonical = new Map<string, InventoryItem>();
   for (const item of items) {
     const canonical = resolveCanonicalSku(item.sku);
-    const existing = merged.get(canonical);
-    if (existing) {
-      existing.onHand.nv += item.onHand.nv;
-      existing.onHand.pa += item.onHand.pa;
-      existing.lots.push(...item.lots);
-    } else {
-      merged.set(canonical, {
-        ...item,
-        sku: canonical,
-        onHand: { ...item.onHand },
-        lots: [...item.lots],
-      });
+    const isCanonicalsOwnRecord = item.sku === canonical;
+    const existing = byCanonical.get(canonical);
+
+    if (!existing || isCanonicalsOwnRecord) {
+      byCanonical.set(canonical, { ...item, sku: canonical });
     }
   }
-  return Array.from(merged.values());
+  return Array.from(byCanonical.values());
 }
 
 /** Pull from both sources and compute every metric. */
