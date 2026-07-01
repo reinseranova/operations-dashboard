@@ -29,8 +29,10 @@ import type {
 
 const SHOPIFY_TIMEOUT_MS = 45_000;
 // ShipHero pull budget — keeps the whole compute under Vercel's 60s limit so
-// /api/refresh stores a snapshot instead of timing out.
-const SHIPHERO_BUDGET_MS = 45_000;
+// /api/refresh stores a snapshot instead of timing out. Loops and credit waits
+// stop past this; a single in-flight request is separately capped at 15s, so
+// worst case ≈ 40 + 15 = 55s, comfortably under 60.
+const SHIPHERO_BUDGET_MS = 40_000;
 
 function emptyShipHeroSummary(): ShipHeroSummary {
   return {

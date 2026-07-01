@@ -145,10 +145,15 @@ async function shipheroGraphQL<T>(
   query: string,
   variables: Record<string, unknown> = {},
 ): Promise<T> {
-  const maxAttempts = 5;
+  const maxAttempts = 4;
   let refreshedOn401 = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Stop before starting another attempt once the budget is spent.
+    if (Date.now() >= shipheroDeadline) {
+      throw new Error("ShipHero time budget exceeded.");
+    }
+
     const token = await getAccessToken();
     const res = await fetch(SHIPHERO_GRAPHQL_ENDPOINT, {
       method: "POST",
@@ -158,6 +163,8 @@ async function shipheroGraphQL<T>(
       },
       body: JSON.stringify({ query, variables }),
       cache: "no-store",
+      // Bound each request so a hung connection can't blow the function budget.
+      signal: AbortSignal.timeout(15_000),
     });
 
     if (res.status === 401 && !refreshedOn401) {
@@ -167,7 +174,11 @@ async function shipheroGraphQL<T>(
     }
 
     if (res.status === 429) {
-      await sleep(Math.min(1000 * 2 ** attempt, 16000));
+      const waitMs = Math.min(1000 * 2 ** attempt, 12000);
+      if (Date.now() + waitMs > shipheroDeadline) {
+        throw new Error("ShipHero time budget exceeded (HTTP 429).");
+      }
+      await sleep(waitMs);
       continue;
     }
 
@@ -187,8 +198,8 @@ async function shipheroGraphQL<T>(
       // have enough credits". Honor that (capped) instead of guessing.
       const secs = throttleMsg.match(/in\s+(\d+)\s+second/i)?.[1];
       const waitMs = secs
-        ? Math.min(Number(secs) * 1000 + 500, 20000)
-        : Math.min(1000 * 2 ** attempt, 16000);
+        ? Math.min(Number(secs) * 1000 + 500, 12000)
+        : Math.min(1000 * 2 ** attempt, 12000);
       // Don't sleep past the overall budget — bail so the caller can return.
       if (Date.now() + waitMs > shipheroDeadline) {
         throw new Error("ShipHero time budget exceeded waiting for credits.");
@@ -457,69 +468,26 @@ interface ExpirationLotsPage {
 }
 
 /**
- * Attach lots per SKU/warehouse from `expiration_lots`. Each Lot nests its
- * `locations`, and each location carries a warehouse_id + quantity we map to
- * NV/PA. Isolated from stock so a schema difference here can't blank inventory.
+ * Attach lots per SKU/warehouse.
+ *
+ * TEMPORARILY DISABLED: the `expiration_lots` → `locations` path we tried does
+ * not expose a per-lot `quantity` on the `Location` type ("Cannot query field
+ * 'quantity' on type 'Location'"), and enumerating all lots is an expensive
+ * extra paginated query. Stock and days-of-stock (the core metrics) don't need
+ * it, and the UI shows "No lot detail reported" gracefully. The correct
+ * warehouse-scoped path with quantities is `warehouse_products.locations`
+ * (ItemLocation) → `expiration_lot`; wire that here once its exact field names
+ * are confirmed against the live schema, and nothing else needs to change.
  */
 async function attachLots(
-  skuMap: Map<string, SkuEntry>,
-  ids: WarehouseIdMap,
+  _skuMap: Map<string, SkuEntry>,
+  _ids: WarehouseIdMap,
 ): Promise<void> {
-  let cursor: string | null = null;
-  do {
-    const data: ExpirationLotsPage = await shipheroGraphQL<ExpirationLotsPage>(
-      /* GraphQL */ `
-        query Lots($cursor: String) {
-          expiration_lots {
-            data(first: 100, after: $cursor) {
-              edges {
-                node {
-                  name
-                  sku
-                  expires_at
-                  locations {
-                    edges {
-                      node {
-                        quantity
-                        warehouse_id
-                      }
-                    }
-                  }
-                }
-              }
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-            }
-          }
-        }
-      `,
-      { cursor },
-    );
-
-    for (const edge of data.expiration_lots.data.edges) {
-      const lot = edge.node;
-      if (!lot.sku) continue;
-      const entry = skuMap.get(lot.sku);
-      if (!entry) continue;
-      for (const loc of lot.locations?.edges ?? []) {
-        const key = keyForWarehouseId(ids, loc.node.warehouse_id);
-        if (!key) continue;
-        entry.lots.push({
-          warehouseKey: key,
-          warehouseName: warehouseNameFor(key),
-          lotNumber: lot.name ?? "—",
-          quantity: loc.node.quantity ?? 0,
-          expirationDate: lot.expires_at ? lot.expires_at.slice(0, 10) : null,
-        });
-      }
-    }
-
-    cursor = data.expiration_lots.data.pageInfo.hasNextPage
-      ? data.expiration_lots.data.pageInfo.endCursor
-      : null;
-  } while (cursor && budgetLeft());
+  // Reference the interfaces/helpers so they remain valid for the future impl.
+  void (null as unknown as ExpirationLotsPage);
+  void keyForWarehouseId;
+  void warehouseNameFor;
+  return;
 }
 
 // ===========================================================================
@@ -538,8 +506,16 @@ export async function getShipHeroSummary(): Promise<SummaryResult> {
   const today = todayIso();
   const warnings: string[] = [];
 
-  // Sequential (not parallel) so we don't thrash the shared credit pool — the
-  // client already backs off on ShipHero's credit hint between pages.
+  // Sequential (not parallel) so we don't thrash the shared credit pool, and
+  // ordered cheapest-first so if the time budget is hit it only sacrifices the
+  // heaviest metric (fulfilled-today, which paginates the day's orders).
+  const returnsToday = await safe(() => countReturnsToday(today), 0, "Returns today", warnings);
+  const newReceivalsToday = await safe(
+    () => countReceivalsToday(today),
+    0,
+    "New receivals today",
+    warnings,
+  );
   const ordersOnHold = await safe(
     () => fetchOrdersOnHold(),
     { total: 0, breakdown: emptyBreakdown() },
@@ -550,13 +526,6 @@ export async function getShipHeroSummary(): Promise<SummaryResult> {
     () => countFulfilledToday(today),
     0,
     "Orders fulfilled today",
-    warnings,
-  );
-  const returnsToday = await safe(() => countReturnsToday(today), 0, "Returns today", warnings);
-  const newReceivalsToday = await safe(
-    () => countReceivalsToday(today),
-    0,
-    "New receivals today",
     warnings,
   );
 
