@@ -17,7 +17,7 @@
  *   - Warehouse IDs (by name) ……… `account` → data.warehouses (cached)
  *   - Lots per SKU …………………… `warehouse_products(warehouse_id).locations`
  *     → ItemLocation.quantity + ItemLocation.expiration_lot (NOT Location.quantity)
- *   - Orders fulfilled today ……… `orders(fulfillment_status, updated_from)`
+ *   - Orders fulfilled today ……… `shipments(date_from, date_to)` → distinct order_id
  *   - Returns received today ……… `returns(date_from)` → created_at
  *   - New receivals today ………… `warehouse_products(updated_from).inbounds`
  *
@@ -597,46 +597,75 @@ async function safe<T>(
   }
 }
 
-interface IdOrdersPage {
-  orders: {
+function nextDayIso(dateIso: string): string {
+  const d = new Date(`${dateIso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+interface ShipmentsPage {
+  shipments: {
     data: {
-      edges: Array<{ node: { id: string } }>;
+      edges: Array<{
+        node: {
+          id: string;
+          order_id: string | null;
+          warehouse_id: string | null;
+          created_date: string | null;
+        };
+      }>;
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
     };
   };
 }
 
-/** Orders fulfilled today: fulfillment_status "fulfilled", updated today. */
+/**
+ * Orders fulfilled (shipped) today: distinct order_id across shipment
+ * records created today. Shipments carry their own created_date — the
+ * timestamp the label was generated/confirmed — unlike
+ * Order.fulfillment_status, which is a mutable current-state snapshot that
+ * can drift from "shipped today" (an order fulfilled yesterday but edited
+ * today would match; an order shipped today whose status later changes
+ * wouldn't). A single order can produce more than one shipment (split
+ * shipment), so we count distinct order_id, not shipment rows.
+ */
 async function countFulfilledToday(today: string): Promise<number> {
-  let count = 0;
+  const orderIds = new Set<string>();
   let cursor: string | null = null;
   do {
-    const data: IdOrdersPage = await shipheroGraphQL<IdOrdersPage>(
+    const data: ShipmentsPage = await shipheroGraphQL<ShipmentsPage>(
       /* GraphQL */ `
-        query Fulfilled($cursor: String, $date: ISODateTime) {
-          orders(fulfillment_status: "fulfilled", updated_from: $date) {
+        query Shipments($cursor: String, $from: ISODateTime, $to: ISODateTime) {
+          shipments(date_from: $from, date_to: $to) {
+            request_id
+            complexity
             data(first: 100, after: $cursor) {
-              edges {
-                node {
-                  id
-                }
-              }
               pageInfo {
                 hasNextPage
                 endCursor
+              }
+              edges {
+                node {
+                  id
+                  order_id
+                  warehouse_id
+                  created_date
+                }
               }
             }
           }
         }
       `,
-      { cursor, date: dayStart(today) },
+      { cursor, from: dayStart(today), to: dayStart(nextDayIso(today)) },
     );
-    count += data.orders.data.edges.length;
-    cursor = data.orders.data.pageInfo.hasNextPage
-      ? data.orders.data.pageInfo.endCursor
+    for (const edge of data.shipments.data.edges) {
+      if (edge.node.order_id) orderIds.add(edge.node.order_id);
+    }
+    cursor = data.shipments.data.pageInfo.hasNextPage
+      ? data.shipments.data.pageInfo.endCursor
       : null;
   } while (cursor && budgetLeft());
-  return count;
+  return orderIds.size;
 }
 
 interface ReturnsPage {
