@@ -72,3 +72,17 @@ export async function kvDel(key: string): Promise<void> {
     console.error(`[kv] del failed for "${key}":`, err);
   }
 }
+
+/** Delete every key starting with `prefix`. No-op when KV isn't configured. */
+export async function kvDeleteByPrefix(prefix: string): Promise<void> {
+  const client = getClient();
+  if (!client) return;
+  try {
+    const keys = await client.keys(`${prefix}*`);
+    if (keys.length > 0) {
+      await client.del(...keys);
+    }
+  } catch (err) {
+    console.error(`[kv] deleteByPrefix failed for "${prefix}":`, err);
+  }
+}

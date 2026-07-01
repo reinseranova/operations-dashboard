@@ -14,7 +14,12 @@
  */
 import { ROLLING_WINDOW_DAYS, KV_KEYS } from "./config";
 import { isKvConfigured, kvGet, kvSet } from "./kv";
-import { getShopifyData, type ShopifyResult } from "./shopify";
+import {
+  EXCLUDED_SKUS,
+  PRODUCT_NAMES,
+  getShopifyData,
+  type ShopifyResult,
+} from "./shopify";
 import {
   getShipHeroInventory,
   getShipHeroSummary,
@@ -37,17 +42,6 @@ const SHIPHERO_BUDGET_MS = 40_000;
 function emptyShipHeroSummary(): ShipHeroSummary {
   return {
     ordersFulfilledToday: 0,
-    ordersOnHold: {
-      total: 0,
-      breakdown: {
-        fraud_hold: 0,
-        address_hold: 0,
-        shipping_method_hold: 0,
-        operator_hold: 0,
-        payment_hold: 0,
-        client_hold: 0,
-      },
-    },
     returnsToday: 0,
     newReceivalsToday: 0,
   };
@@ -116,47 +110,40 @@ export async function computeSnapshot(): Promise<Snapshot> {
 
   const sales = shopify.salesBySku;
 
-  const skus: SkuRow[] = inventory.skus.map((item) => {
-    const total = item.onHand.nv + item.onHand.pa;
+  const skus: SkuRow[] = inventory.skus
+    .filter((item) => !EXCLUDED_SKUS.has(item.sku))
+    .map((item) => {
+      const total = item.onHand.nv + item.onHand.pa;
 
-    // units30 is null when we have no Shopify data at all (no token / backfill
-    // in progress / error / timeout). A SKU simply absent from the map means 0.
-    const units30 = sales ? sales[item.sku] ?? 0 : null;
-    const dailyVelocity = units30 === null ? null : units30 / ROLLING_WINDOW_DAYS;
+      // units30 is null when we have no Shopify data at all (no token / backfill
+      // in progress / error / timeout). A SKU simply absent from the map means 0.
+      const units30 = sales ? sales[item.sku] ?? 0 : null;
+      const dailyVelocity = units30 === null ? null : units30 / ROLLING_WINDOW_DAYS;
 
-    // Days of stock = current stock / daily velocity. Guard divide-by-zero:
-    // no recent sales => null (UI shows "—" / "No recent sales").
-    const daysOfStock =
-      dailyVelocity && dailyVelocity > 0 ? total / dailyVelocity : null;
+      // Days of stock = current stock / daily velocity. Guard divide-by-zero:
+      // no recent sales => null (UI shows "—" / "No recent sales").
+      const daysOfStock =
+        dailyVelocity && dailyVelocity > 0 ? total / dailyVelocity : null;
 
-    return {
-      sku: item.sku,
-      productName: item.productName,
-      stock: { nv: item.onHand.nv, pa: item.onHand.pa, total },
-      units30,
-      dailyVelocity,
-      daysOfStock,
-      lots: item.lots,
-    };
-  });
+      return {
+        sku: item.sku,
+        productName: PRODUCT_NAMES[item.sku] ?? item.productName,
+        stock: { nv: item.onHand.nv, pa: item.onHand.pa, total },
+        units30,
+        dailyVelocity,
+        daysOfStock,
+        lots: item.lots,
+      };
+    });
 
-  // Sort lowest days-of-stock first so the most urgent SKUs surface at the top;
-  // SKUs with no recent sales sort to the bottom.
-  skus.sort((a, b) => {
-    if (a.daysOfStock === null && b.daysOfStock === null) {
-      return a.sku.localeCompare(b.sku);
-    }
-    if (a.daysOfStock === null) return 1;
-    if (b.daysOfStock === null) return -1;
-    return a.daysOfStock - b.daysOfStock;
-  });
+  // Highest total stock first, lowest last. No UI sort controls — always this order.
+  skus.sort((a, b) => b.stock.total - a.stock.total);
 
   return {
     generatedAt: new Date().toISOString(),
     skus,
     summary: {
       ordersFulfilledToday: summary.ordersFulfilledToday,
-      ordersOnHold: summary.ordersOnHold,
       returnsToday: summary.returnsToday,
       newReceivalsToday: summary.newReceivalsToday,
       ordersCreatedTodayShopify: shopify.ordersCreatedToday,

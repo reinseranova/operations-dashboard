@@ -36,8 +36,213 @@ import {
   KV_KEYS,
   shopifyDailyKey,
 } from "./config";
-import { isKvConfigured, kvGet, kvSet } from "./kv";
+import { isKvConfigured, kvDeleteByPrefix, kvGet, kvSet } from "./kv";
 import type { ShopifyMeta, ShopifyStatus } from "./types";
+
+// Canonical human-readable names for component SKUs.
+// Bundle SKUs are virtual and never appear in the inventory table.
+// Any SKU not listed here falls back to displaying the SKU code.
+export const PRODUCT_NAMES: Record<string, string> = {
+  // Anti Aging MIS
+  "DPCD9-WM272001": "1 Month Anti Aging MIS",
+  "DPCD9-WM273001": "2 Month Anti Aging MIS",
+  "DPCD9-WM274001": "3 Month Anti Aging MIS",
+
+  // MIS Patches
+  "DPCD9-WM304001": "Micro Infusion Patches",
+
+  // Collagen Mask
+  "DPCD9-WM248001": "Collagen Mask",
+
+  // Collagen Cream (new)
+  "SERA-COL-CREAM-50G": "Collagen Cream",
+
+  // Collagen Cleanser
+  "SERA-COL-CLEANSER-75ML": "Collagen Cleanser",
+
+  // Pigmentation Clay Mask (two SKU names, same product)
+  "SERA-MASK-DARK-50G": "Pigmentation Clay Mask",
+  "SERA-MASK-DARK-50G-1MONTH": "Pigmentation Clay Mask",
+
+  // Serums
+  "SERA-SERUM-PIG-30ML": "Advanced Pigmentation Serum",
+  "SERA-SERUM-SCAR-30ML": "Acne Scar Serum",
+  "SERA-SERUM-HYA-30ML": "Hyaluronic Acid Serum",
+
+  // Lip & SPF
+  "SERA-LIP-SERUM-8ML": "Lip Rejuvenation Serum",
+  "SERA-SPF- 50ML": "SPF Liquid Serum", // note trailing space in SKU
+
+  // Freebies (shown in table but flagged)
+  "SERA-MASK-COL-1POUCH": "Collagen Mask 1 Pouch (Freebie)",
+  "DPCD9-WM304001-1POUCH": "MIS Patches 1 Pouch (Freebie)",
+
+  // Deprecated (should not appear, but named for clarity if they do)
+  "DPCD9-WM293001": "Old Collagen Cream (Deprecated)",
+};
+
+// SKUs to exclude from the inventory table entirely — digital products,
+// internal placeholders, etc. that are not physically stocked.
+export const EXCLUDED_SKUS = new Set([
+  "ECR-001", // digital product — not physically stocked
+]);
+
+// Maps Shopify bundle SKU → component SKUs and quantities consumed per sale.
+// When a bundle SKU appears in an order line item (qty N), each component
+// gets N * componentQty added to its 30-day sold total.
+export const BUNDLE_MAP: Record<string, { sku: string; qty: number }[]> = {
+  // ── Infusion Enhancement Bundle ────────────────────────────────────────
+  "MASK-CREAM-PATCH-1-MONTH": [
+    { sku: "SERA-COL-CREAM-50G", qty: 1 },
+    { sku: "DPCD9-WM248001", qty: 1 },
+    { sku: "DPCD9-WM304001", qty: 1 },
+  ],
+  "MASK-CREAM-PATCH-2-MONTH": [
+    { sku: "SERA-COL-CREAM-50G", qty: 2 },
+    { sku: "DPCD9-WM248001", qty: 2 },
+    { sku: "DPCD9-WM304001", qty: 2 },
+  ],
+  "MASK-CREAM-PATCH-3-MONTH": [
+    { sku: "SERA-COL-CREAM-50G", qty: 3 },
+    { sku: "DPCD9-WM248001", qty: 3 },
+    { sku: "DPCD9-WM304001", qty: 3 },
+  ],
+  "MASK-CREAM-PATCH-6-MONTH": [
+    { sku: "SERA-COL-CREAM-50G", qty: 6 },
+    { sku: "DPCD9-WM248001", qty: 6 },
+    { sku: "DPCD9-WM304001", qty: 6 },
+  ],
+  "MASK-CREAM-PATCH-12-MONTH": [
+    { sku: "SERA-COL-CREAM-50G", qty: 12 },
+    { sku: "DPCD9-WM248001", qty: 12 },
+    { sku: "DPCD9-WM304001", qty: 12 },
+  ],
+
+  // ── All In One Bundle ──────────────────────────────────────────────────
+  // 6M and 12M use the 3M MIS SKU × 2 and × 4 respectively
+  "FULL-RANGE-OF-PRODUCTS-1MONTH": [
+    { sku: "DPCD9-WM272001", qty: 1 },
+    { sku: "DPCD9-WM304001", qty: 1 },
+    { sku: "SERA-COL-CREAM-50G", qty: 1 },
+    { sku: "DPCD9-WM248001", qty: 1 },
+  ],
+  "FULL-RANGE-OF-PRODUCTS-2MONTH": [
+    { sku: "DPCD9-WM273001", qty: 1 },
+    { sku: "DPCD9-WM304001", qty: 2 },
+    { sku: "SERA-COL-CREAM-50G", qty: 2 },
+    { sku: "DPCD9-WM248001", qty: 2 },
+  ],
+  "FULL-RANGE-OF-PRODUCTS-3MONTH": [
+    { sku: "DPCD9-WM274001", qty: 1 },
+    { sku: "DPCD9-WM304001", qty: 3 },
+    { sku: "SERA-COL-CREAM-50G", qty: 3 },
+    { sku: "DPCD9-WM248001", qty: 3 },
+  ],
+  "FULL-RANGE-OF-PRODUCTS-6MONTH": [
+    { sku: "DPCD9-WM274001", qty: 2 },
+    { sku: "DPCD9-WM304001", qty: 6 },
+    { sku: "SERA-COL-CREAM-50G", qty: 6 },
+    { sku: "DPCD9-WM248001", qty: 6 },
+  ],
+  "FULL-RANGE-OF-PRODUCTS-12MONTH": [
+    { sku: "DPCD9-WM274001", qty: 4 },
+    { sku: "DPCD9-WM304001", qty: 12 },
+    { sku: "SERA-COL-CREAM-50G", qty: 12 },
+    { sku: "DPCD9-WM248001", qty: 12 },
+  ],
+
+  // ── Multi-Unit Bundles — Collagen Cream ───────────────────────────────
+  "SERA-COL-CREAM-50G-2PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 2 }],
+  "SERA-COL-CREAM-50G-3PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 3 }],
+  "SERA-COL-CREAM-50G-6PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 6 }],
+  "SERA-COL-CREAM-50G-12PCS": [{ sku: "SERA-COL-CREAM-50G", qty: 12 }],
+
+  // ── Multi-Unit Bundles — Collagen Cleanser ────────────────────────────
+  "SERA-COL-CLEANSER-75ML-2MONTH": [{ sku: "SERA-COL-CLEANSER-75ML", qty: 2 }],
+  "SERA-COL-CLEANSER-75ML-3MONTH": [{ sku: "SERA-COL-CLEANSER-75ML", qty: 3 }],
+
+  // ── Multi-Unit Bundles — Anti Aging MIS ──────────────────────────────
+  "DPCD9-WM274001-2PCS": [{ sku: "DPCD9-WM274001", qty: 2 }],
+  "DPCD9-WM274001-4PCS": [{ sku: "DPCD9-WM274001", qty: 4 }],
+
+  // ── Multi-Unit Bundles — MIS Patches ─────────────────────────────────
+  "DPCD9-WM304001-2PCS": [{ sku: "DPCD9-WM304001", qty: 2 }],
+  "DPCD9-WM304001-3PCS": [{ sku: "DPCD9-WM304001", qty: 3 }],
+  "DPCD9-WM304001-6PCS": [{ sku: "DPCD9-WM304001", qty: 6 }],
+  "DPCD9-WM304001-12PCS": [{ sku: "DPCD9-WM304001", qty: 12 }],
+
+  // ── Multi-Unit Bundles — Collagen Mask ───────────────────────────────
+  "DPCD9-WM248001-2PCS": [{ sku: "DPCD9-WM248001", qty: 2 }],
+  "DPCD9-WM248001-3PCS": [{ sku: "DPCD9-WM248001", qty: 3 }],
+  "DPCD9-WM248001-6PCS": [{ sku: "DPCD9-WM248001", qty: 6 }],
+  "DPCD9-WM248001-12PCS": [{ sku: "DPCD9-WM248001", qty: 12 }],
+
+  // ── Multi-Unit Bundles — Advanced Pigmentation Serum ─────────────────
+  "SERA-SERUM-PIG-30ML-2MONTH": [{ sku: "SERA-SERUM-PIG-30ML", qty: 2 }],
+  "SERA-SERUM-PIG-30ML-3MONTH": [{ sku: "SERA-SERUM-PIG-30ML", qty: 3 }],
+  "SERA-SERUM-PIG-30ML-6MONTH": [{ sku: "SERA-SERUM-PIG-30ML", qty: 6 }],
+
+  // ── Multi-Unit Bundles — Acne Scar Serum ─────────────────────────────
+  "SERA-SERUM-SCAR-30ML-2MONTH": [{ sku: "SERA-SERUM-SCAR-30ML", qty: 2 }],
+  "SERA-SERUM-SCAR-30ML-3MONTH": [{ sku: "SERA-SERUM-SCAR-30ML", qty: 3 }],
+
+  // ── Multi-Unit Bundles — Hyaluronic Acid Serum ───────────────────────
+  "SERA-SERUM-HYA-30ML-2MONTH": [{ sku: "SERA-SERUM-HYA-30ML", qty: 2 }],
+  "SERA-SERUM-HYA-30ML-3MONTH": [{ sku: "SERA-SERUM-HYA-30ML", qty: 3 }],
+
+  // ── Multi-Unit Bundles — Pigmentation Clay Mask ──────────────────────
+  "SERA-MASK-DARK-50G-2MONTH": [{ sku: "SERA-MASK-DARK-50G", qty: 2 }],
+  "SERA-MASK-DARK-50G-3MONTH": [{ sku: "SERA-MASK-DARK-50G", qty: 3 }],
+
+  // ── Multi-Unit Bundles — Lip Rejuvenation Serum ──────────────────────
+  "SERA-LIP-SERUM-8ML-2MONTH": [{ sku: "SERA-LIP-SERUM-8ML", qty: 2 }],
+  "SERA-LIP-SERUM-8ML-3MONTH": [{ sku: "SERA-LIP-SERUM-8ML", qty: 3 }],
+
+  // ── Multi-Unit Bundles — SPF Liquid Serum ────────────────────────────
+  // Note: base SKU has a trailing space — 'SERA-SPF- 50ML' — match exactly
+  "SERA-SPF- 50ML-2MONTH": [{ sku: "SERA-SPF- 50ML", qty: 2 }],
+  "SERA-SPF- 50ML-3MONTH": [{ sku: "SERA-SPF- 50ML", qty: 3 }],
+  "SERA-SPF- 50ML-6MONTH": [{ sku: "SERA-SPF- 50ML", qty: 6 }],
+};
+
+// Deprecated and alias SKUs: when seen in Shopify orders, normalise to the
+// canonical SKU before looking up in BUNDLE_MAP or aggregating as a direct sale.
+export const SKU_ALIASES: Record<string, string> = {
+  "DPCD9-WM293001": "SERA-COL-CREAM-50G", // old collagen cream → new
+  "SERA-MASK-DARK-50G-1MONTH": "SERA-MASK-DARK-50G", // alias → primary
+};
+
+// Freebie SKUs — ignore these entirely in sales aggregation (not real demand).
+export const FREEBIE_SKUS = new Set([
+  "SERA-MASK-COL-1POUCH",
+  "DPCD9-WM304001-1POUCH",
+]);
+
+// Bump whenever BUNDLE_MAP/SKU_ALIASES/FREEBIE_SKUS change shape — see
+// invalidateForBundleMapVersion() below, which busts stale per-day KV entries
+// computed under the old (non-expanded) rules.
+const CURRENT_BUNDLE_MAP_VERSION = 1;
+
+/**
+ * Expand one order line item into its component SKU(s), mutating `acc`
+ * (SKU → units). Normalises aliases first, drops freebies, and expands
+ * bundle SKUs into their components at qty * componentQty; anything else is
+ * a direct component sale.
+ */
+function expandLineItem(sku: string, qty: number, acc: SalesMap): void {
+  const canonical = SKU_ALIASES[sku] ?? sku;
+
+  if (FREEBIE_SKUS.has(canonical)) return;
+
+  const components = BUNDLE_MAP[canonical];
+  if (components) {
+    for (const { sku: compSku, qty: compQty } of components) {
+      acc[compSku] = (acc[compSku] ?? 0) + qty * compQty;
+    }
+  } else {
+    acc[canonical] = (acc[canonical] ?? 0) + qty;
+  }
+}
 
 export interface ShopifyResult {
   status: ShopifyStatus;
@@ -252,7 +457,7 @@ async function sumUnitsForWindow(
       for (const li of edge.node.lineItems.edges) {
         const sku = li.node.sku;
         if (!sku) continue; // group strictly by SKU; skip line items without one
-        sales[sku] = (sales[sku] ?? 0) + (li.node.quantity ?? 0);
+        expandLineItem(sku, li.node.quantity ?? 0, sales);
       }
     }
     cursor = data.orders.pageInfo.hasNextPage
@@ -431,7 +636,7 @@ async function parseBulkJsonl(url: string): Promise<Record<string, SalesMap>> {
   for (const li of lineItems) {
     const day = orderDay[li.parent];
     if (!day) continue;
-    (byDay[day] ??= {})[li.sku] = (byDay[day][li.sku] ?? 0) + li.quantity;
+    expandLineItem(li.sku, li.quantity, (byDay[day] ??= {}));
   }
   return byDay;
 }
@@ -451,6 +656,25 @@ async function readMeta(): Promise<ShopifyMeta> {
 
 async function writeMeta(meta: ShopifyMeta): Promise<void> {
   await kvSet(KV_KEYS.shopifyMeta, meta);
+}
+
+/**
+ * One-time cache bust for the bundle-expansion change: daily entries computed
+ * before BUNDLE_MAP existed record raw bundle-SKU sales instead of expanded
+ * component sales, which would understate component velocity if left mixed
+ * in with new data. Wipe them and restart the backfill/sync state machine.
+ */
+async function invalidateForBundleMapVersion(meta: ShopifyMeta): Promise<ShopifyMeta> {
+  if (meta.bundleMapVersion === CURRENT_BUNDLE_MAP_VERSION) return meta;
+
+  await kvDeleteByPrefix(KV_KEYS.shopifyDailyPrefix);
+  const reset: ShopifyMeta = {
+    lastSyncDate: null,
+    backfill: { status: "none", bulkOperationId: null, startedAt: null },
+    bundleMapVersion: CURRENT_BUNDLE_MAP_VERSION,
+  };
+  await writeMeta(reset);
+  return reset;
 }
 
 // Keep daily entries a little longer than the window so trailing sums are safe.
@@ -514,7 +738,7 @@ export async function getShopifyData(): Promise<ShopifyResult> {
 
 /** KV mode: backfill + incremental daily sync. */
 async function getShopifyDataWithKv(): Promise<ShopifyResult> {
-  const meta = await readMeta();
+  const meta = await invalidateForBundleMapVersion(await readMeta());
 
   // ---- Backfill state machine ----------------------------------------------
   if (meta.backfill.status === "none") {
