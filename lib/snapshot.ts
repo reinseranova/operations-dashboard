@@ -160,13 +160,17 @@ export async function refreshSnapshot(): Promise<Snapshot> {
 }
 
 /**
- * What the dashboard calls. Prefers the stored KV snapshot; if KV isn't
- * configured (or nothing stored yet), computes fresh.
+ * What the dashboard calls. Prefers the stored KV snapshot (instant); on a cache
+ * miss it computes once AND stores, so subsequent loads are fast. Without KV it
+ * always computes live — fine for low volume, but on this store's order volume
+ * connecting KV (so /api/refresh precomputes the snapshot) is what keeps page
+ * loads from doing heavy work inline. See README.
  */
 export async function getSnapshotForDashboard(): Promise<Snapshot> {
   if (isKvConfigured()) {
     const stored = await kvGet<Snapshot>(KV_KEYS.snapshot);
     if (stored) return stored;
+    return refreshSnapshot(); // first run: compute + persist for next time
   }
   return computeSnapshot();
 }

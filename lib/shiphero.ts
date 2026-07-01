@@ -165,11 +165,17 @@ async function shipheroGraphQL<T>(
       throw new Error(`ShipHero GraphQL HTTP ${res.status}: ${raw.slice(0, 400)}`);
     }
 
-    const throttled = body.errors?.some((e) =>
+    const throttleMsg = body.errors?.find((e) =>
       /throttle|credit|too many|rate limit/i.test(e.message),
-    );
-    if (throttled && attempt < maxAttempts) {
-      await sleep(Math.min(1000 * 2 ** attempt, 16000));
+    )?.message;
+    if (throttleMsg && attempt < maxAttempts) {
+      // ShipHero tells us exactly how long to wait, e.g. "In 2 seconds you will
+      // have enough credits". Honor that (capped) instead of guessing.
+      const secs = throttleMsg.match(/in\s+(\d+)\s+second/i)?.[1];
+      const waitMs = secs
+        ? Math.min(Number(secs) * 1000 + 500, 20000)
+        : Math.min(1000 * 2 ** attempt, 16000);
+      await sleep(waitMs);
       continue;
     }
 
@@ -198,13 +204,18 @@ interface AccountWarehouse {
   identifier: string | null;
   company_name: string | null;
   company_alias: string | null;
+  active: boolean | null;
 }
 
-let warehouseIdMemo: Record<WarehouseKey, string> | null = null;
+// Each key can map to MORE THAN ONE ShipHero warehouse id (this account exposes
+// several records per identifier); stock is summed across all of them.
+type WarehouseIdMap = Record<WarehouseKey, string[]>;
 
-/** True if any of the warehouse's names (or an "A / B" combination) equals `name`. */
-function warehouseMatchesName(w: AccountWarehouse, name: string): boolean {
-  const target = name.trim().toLowerCase();
+let warehouseIdMemo: WarehouseIdMap | null = null;
+
+/** True if any of the warehouse's names (or an "A / B" combo) matches a configured name. */
+function warehouseMatches(w: AccountWarehouse, matchNames: string[]): boolean {
+  const targets = new Set(matchNames.map((n) => n.trim().toLowerCase()));
   const parts = [w.identifier, w.company_name, w.company_alias]
     .map((s) => (s ?? "").trim())
     .filter(Boolean);
@@ -214,18 +225,19 @@ function warehouseMatchesName(w: AccountWarehouse, name: string): boolean {
       if (a !== b) candidates.add(`${a} / ${b}`.toLowerCase());
     }
   }
-  return candidates.has(target);
+  for (const c of candidates) if (targets.has(c)) return true;
+  return false;
 }
 
 /**
- * Resolve the two configured warehouse names to their ShipHero IDs. Cached in
- * memory and KV. If a name can't be matched, throws an error listing the actual
- * warehouses ShipHero returned so the configured names can be corrected.
+ * Resolve the configured warehouse names to their ShipHero ID(s). Cached in
+ * memory + KV. Prefers active warehouses; if a name can't be matched at all,
+ * throws an error listing the actual warehouses so config can be corrected.
  */
-async function resolveWarehouseIds(): Promise<Record<WarehouseKey, string>> {
+async function resolveWarehouseIds(): Promise<WarehouseIdMap> {
   if (warehouseIdMemo) return warehouseIdMemo;
   if (isKvConfigured()) {
-    const cached = await kvGet<Record<WarehouseKey, string>>(KV_KEYS.shipheroWarehouses);
+    const cached = await kvGet<WarehouseIdMap>(KV_KEYS.shipheroWarehouses);
     if (cached) {
       warehouseIdMemo = cached;
       return cached;
@@ -244,6 +256,7 @@ async function resolveWarehouseIds(): Promise<Record<WarehouseKey, string>> {
             identifier
             company_name
             company_alias
+            active
           }
         }
       }
@@ -251,19 +264,21 @@ async function resolveWarehouseIds(): Promise<Record<WarehouseKey, string>> {
   `);
 
   const warehouses = data.account.data.warehouses ?? [];
-  const map = {} as Record<WarehouseKey, string>;
-  for (const { key, name } of WAREHOUSES) {
-    const match = warehouses.find((w) => warehouseMatchesName(w, name));
-    if (match) map[key] = match.id;
+  const map = {} as WarehouseIdMap;
+  for (const { key, matchNames } of WAREHOUSES) {
+    const matches = warehouses.filter((w) => warehouseMatches(w, matchNames));
+    // Prefer active warehouses; fall back to all matches if none flag active.
+    const active = matches.filter((w) => w.active !== false);
+    map[key] = (active.length > 0 ? active : matches).map((w) => w.id);
   }
 
-  const missing = WAREHOUSES.filter((w) => !map[w.key]);
+  const missing = WAREHOUSES.filter((w) => map[w.key].length === 0);
   if (missing.length > 0) {
     const found =
       warehouses
         .map(
           (w) =>
-            `[id=${w.id} identifier="${w.identifier}" company_name="${w.company_name}" company_alias="${w.company_alias}"]`,
+            `[id=${w.id} identifier="${w.identifier}" company_name="${w.company_name}" company_alias="${w.company_alias}" active=${w.active}]`,
         )
         .join("; ") || "no warehouses returned";
     throw new Error(
@@ -281,12 +296,12 @@ async function resolveWarehouseIds(): Promise<Record<WarehouseKey, string>> {
 }
 
 function keyForWarehouseId(
-  ids: Record<WarehouseKey, string>,
+  ids: WarehouseIdMap,
   id: string | null,
 ): WarehouseKey | null {
   if (!id) return null;
   for (const key of Object.keys(ids) as WarehouseKey[]) {
-    if (ids[key] === id) return key;
+    if (ids[key].includes(id)) return key;
   }
   return null;
 }
@@ -321,55 +336,72 @@ export async function getShipHeroInventory(): Promise<InventoryResult> {
   const ids = await resolveWarehouseIds();
   const skuMap = new Map<string, SkuEntry>();
 
-  // Stock: one paginated warehouse_products query per warehouse.
+  // Stock: paginate warehouse_products for each warehouse id mapped to a key,
+  // summing on_hand. Per-warehouse failures are isolated so one bad warehouse
+  // doesn't blank the rest.
   for (const { key } of WAREHOUSES) {
-    let cursor: string | null = null;
-    do {
-      const data: WarehouseProductsPage = await shipheroGraphQL<WarehouseProductsPage>(
-        /* GraphQL */ `
-          query Stock($cursor: String, $warehouseId: String!) {
-            warehouse_products(warehouse_id: $warehouseId) {
-              data(first: 100, after: $cursor) {
-                edges {
-                  node {
-                    on_hand
-                    product {
-                      sku
-                      name
+    for (const warehouseId of ids[key]) {
+      try {
+        let cursor: string | null = null;
+        do {
+          const data: WarehouseProductsPage =
+            await shipheroGraphQL<WarehouseProductsPage>(
+              /* GraphQL */ `
+                query Stock($cursor: String, $warehouseId: String!) {
+                  warehouse_products(warehouse_id: $warehouseId) {
+                    data(first: 100, after: $cursor) {
+                      edges {
+                        node {
+                          on_hand
+                          product {
+                            sku
+                            name
+                          }
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
                     }
                   }
                 }
-                pageInfo {
-                  hasNextPage
-                  endCursor
-                }
-              }
-            }
+              `,
+              { cursor, warehouseId },
+            );
+
+          for (const edge of data.warehouse_products.data.edges) {
+            const sku = edge.node.product?.sku;
+            if (!sku) continue;
+            const entry =
+              skuMap.get(sku) ??
+              ({
+                sku,
+                productName: edge.node.product?.name ?? null,
+                onHand: { nv: 0, pa: 0 },
+                lots: [],
+              } as SkuEntry);
+            entry.onHand[key] += edge.node.on_hand ?? 0;
+            if (!entry.productName) entry.productName = edge.node.product?.name ?? null;
+            skuMap.set(sku, entry);
           }
-        `,
-        { cursor, warehouseId: ids[key] },
-      );
 
-      for (const edge of data.warehouse_products.data.edges) {
-        const sku = edge.node.product?.sku;
-        if (!sku) continue;
-        const entry =
-          skuMap.get(sku) ??
-          ({
-            sku,
-            productName: edge.node.product?.name ?? null,
-            onHand: { nv: 0, pa: 0 },
-            lots: [],
-          } as SkuEntry);
-        entry.onHand[key] += edge.node.on_hand ?? 0;
-        if (!entry.productName) entry.productName = edge.node.product?.name ?? null;
-        skuMap.set(sku, entry);
+          cursor = data.warehouse_products.data.pageInfo.hasNextPage
+            ? data.warehouse_products.data.pageInfo.endCursor
+            : null;
+        } while (cursor);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[shiphero] stock for warehouse ${warehouseId} failed:`, msg);
+        warnings.push(`Stock (${key.toUpperCase()} / ${warehouseId}): ${msg}`);
       }
+    }
+  }
 
-      cursor = data.warehouse_products.data.pageInfo.hasNextPage
-        ? data.warehouse_products.data.pageInfo.endCursor
-        : null;
-    } while (cursor);
+  // If we got nothing at all but hit errors, treat it as a hard failure so the
+  // dashboard shows the red banner rather than an empty (misleading) table.
+  if (skuMap.size === 0 && warnings.length > 0) {
+    throw new Error(warnings.join(" | "));
   }
 
   // Lots: best-effort — never blocks stock.
@@ -411,7 +443,7 @@ interface ExpirationLotsPage {
  */
 async function attachLots(
   skuMap: Map<string, SkuEntry>,
-  ids: Record<WarehouseKey, string>,
+  ids: WarehouseIdMap,
 ): Promise<void> {
   let cursor: string | null = null;
   do {
@@ -486,13 +518,27 @@ export async function getShipHeroSummary(): Promise<SummaryResult> {
   const today = todayIso();
   const warnings: string[] = [];
 
-  const [ordersOnHold, ordersFulfilledToday, returnsToday, newReceivalsToday] =
-    await Promise.all([
-      safe(() => fetchOrdersOnHold(), { total: 0, breakdown: emptyBreakdown() }, "Orders on hold", warnings),
-      safe(() => countFulfilledToday(today), 0, "Orders fulfilled today", warnings),
-      safe(() => countReturnsToday(today), 0, "Returns today", warnings),
-      safe(() => countReceivalsToday(today), 0, "New receivals today", warnings),
-    ]);
+  // Sequential (not parallel) so we don't thrash the shared credit pool — the
+  // client already backs off on ShipHero's credit hint between pages.
+  const ordersOnHold = await safe(
+    () => fetchOrdersOnHold(),
+    { total: 0, breakdown: emptyBreakdown() },
+    "Orders on hold",
+    warnings,
+  );
+  const ordersFulfilledToday = await safe(
+    () => countFulfilledToday(today),
+    0,
+    "Orders fulfilled today",
+    warnings,
+  );
+  const returnsToday = await safe(() => countReturnsToday(today), 0, "Returns today", warnings);
+  const newReceivalsToday = await safe(
+    () => countReceivalsToday(today),
+    0,
+    "New receivals today",
+    warnings,
+  );
 
   return {
     summary: { ordersFulfilledToday, ordersOnHold, returnsToday, newReceivalsToday },
@@ -711,9 +757,10 @@ interface ReceivalsPage {
  */
 async function countReceivalsToday(today: string): Promise<number> {
   const ids = await resolveWarehouseIds();
+  const warehouseIds = Array.from(new Set(Object.values(ids).flat()));
   let count = 0;
 
-  for (const { key } of WAREHOUSES) {
+  for (const warehouseId of warehouseIds) {
     let cursor: string | null = null;
     do {
       const data: ReceivalsPage = await shipheroGraphQL<ReceivalsPage>(
@@ -740,7 +787,7 @@ async function countReceivalsToday(today: string): Promise<number> {
             }
           }
         `,
-        { cursor, warehouseId: ids[key], date: dayStart(today) },
+        { cursor, warehouseId, date: dayStart(today) },
       );
       for (const edge of data.warehouse_products.data.edges) {
         for (const inb of edge.node.inbounds?.edges ?? []) {

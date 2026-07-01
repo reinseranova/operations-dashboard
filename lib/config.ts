@@ -15,14 +15,27 @@ export const SHIPHERO_GRAPHQL_ENDPOINT = "https://public-api.shiphero.com/graphq
 export const SHIPHERO_REFRESH_ENDPOINT = "https://public-api.shiphero.com/auth/refresh";
 
 /**
- * This account has exactly two warehouses. ShipHero warehouse IDs are opaque
- * and not known ahead of time, so we identify warehouses by their human name
- * and resolve the IDs at runtime (see lib/shiphero.ts). `key` is our short
- * internal handle used throughout the UI / metrics.
+ * ShipHero warehouse IDs are opaque and not known ahead of time, so we identify
+ * warehouses by name and resolve the real IDs at runtime (see lib/shiphero.ts).
+ *
+ * `key` is our short internal handle (nv/pa). `name` is the display label.
+ * `matchNames` is the set of names to match against ShipHero's warehouse
+ * `identifier` / `company_name` / `company_alias` fields — this account's live
+ * identifiers are simply "Primary" (NV) and "LG Express, Inc. PA" (PA). The
+ * account exposes more than one warehouse record per identifier; all matching
+ * records are summed for that key (empty/legacy ones contribute 0).
  */
 export const WAREHOUSES = [
-  { key: "nv" as const, name: "NV LG Express, Inc. / Primary" },
-  { key: "pa" as const, name: "PA LG Express, Inc. / LG Express, Inc. PA" },
+  {
+    key: "nv" as const,
+    name: "NV — Primary",
+    matchNames: ["Primary", "NV LG Express, Inc. / Primary"],
+  },
+  {
+    key: "pa" as const,
+    name: "PA — LG Express, Inc. PA",
+    matchNames: ["LG Express, Inc. PA", "PA LG Express, Inc. / LG Express, Inc. PA"],
+  },
 ];
 
 export type WarehouseKey = (typeof WAREHOUSES)[number]["key"];

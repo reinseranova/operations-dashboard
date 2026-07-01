@@ -70,7 +70,9 @@ function graphqlEndpoint(): string {
 
 interface GraphQLResponse<T> {
   data?: T;
-  errors?: Array<{ message: string; extensions?: { code?: string } }>;
+  // Shopify returns `errors` as an ARRAY for GraphQL field errors, but as a
+  // STRING for auth/routing failures (e.g. bad token, missing scope). Handle both.
+  errors?: Array<{ message: string; extensions?: { code?: string } }> | string;
   extensions?: {
     cost?: {
       requestedQueryCost: number;
@@ -121,7 +123,13 @@ async function shopifyGraphQL<T>(
 
     const body = (await res.json()) as GraphQLResponse<T>;
 
-    const throttled = body.errors?.some(
+    // Auth/routing errors come back as a plain string — surface it directly.
+    if (typeof body.errors === "string") {
+      throw new Error(`Shopify API error: ${body.errors}`);
+    }
+    const errorsArray = Array.isArray(body.errors) ? body.errors : [];
+
+    const throttled = errorsArray.some(
       (e) => e.extensions?.code === "THROTTLED",
     );
     if (throttled) {
@@ -140,9 +148,9 @@ async function shopifyGraphQL<T>(
       continue;
     }
 
-    if (body.errors && body.errors.length > 0) {
+    if (errorsArray.length > 0) {
       throw new Error(
-        `Shopify GraphQL error: ${body.errors.map((e) => e.message).join("; ")}`,
+        `Shopify GraphQL error: ${errorsArray.map((e) => e.message).join("; ")}`,
       );
     }
     if (!body.data) {
