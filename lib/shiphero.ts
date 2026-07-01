@@ -585,7 +585,8 @@ async function fetchOrdersOnHold(): Promise<{
       /* GraphQL */ `
         query HeldOrders($cursor: String) {
           orders(has_hold: true) {
-            data(first: 100, after: $cursor) {
+            # Smaller page so a single request returns within the request timeout.
+            data(first: 50, after: $cursor) {
               edges {
                 node {
                   holds {
@@ -756,7 +757,9 @@ async function countReceivalsToday(today: string): Promise<number> {
         /* GraphQL */ `
           query Receivals($cursor: String, $warehouseId: String!, $date: ISODateTime) {
             warehouse_products(warehouse_id: $warehouseId, updated_from: $date) {
-              data(first: 100, after: $cursor) {
+              # Small page: each warehouse_product pulls its nested inbounds, and
+              # ShipHero caps a single operation at 4004 credits (100/page ≈ 10k).
+              data(first: 20, after: $cursor) {
                 edges {
                   node {
                     inbounds {
