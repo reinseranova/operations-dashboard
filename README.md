@@ -174,12 +174,10 @@ webhook data and the page always shows sample data.
    curl -X POST https://<your-domain>/api/shipping-bootstrap \
      -H "Authorization: Bearer <REFRESH_SECRET>"
    ```
-5. **Verify location names.** ParcelPanel's `location.name` webhook field is
-   what routes each shipment to China vs. USA (`lib/shipping-location.ts`).
-   The webhook route logs the first 20 payloads it sees
-   (`location.name` + carrier + status) — check those logs after step 2 and
-   confirm they match `LOCATION_NAME_MAP` in that file; add alternate
-   spellings there if they don't.
+ParcelPanel's `location.name` webhook field is what routes each shipment to
+China vs. USA — see `LOCATION_NAME_MAP` in `lib/shipping-location.ts`. This has
+already been verified against live payloads; if ParcelPanel ever changes a
+location's display name, add the new spelling there.
 
 The nightly cron in `vercel.json` pre-warms the 15-minute stats cache for both
 locations at 4 AM so the first page load of the day is instant.

@@ -42,12 +42,6 @@ export function ShippingSetupBanner({ loc }: { loc: ShippingLocationKey }) {
           </p>
         </li>
       </ol>
-
-      <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-        ⚠️ After registering the webhook, check the server logs for the first 20 events and
-        verify the <code>location.name</code> values in the payloads match the strings in{" "}
-        <code>lib/shipping-location.ts</code>. Update that file if needed.
-      </div>
     </div>
   );
 }
