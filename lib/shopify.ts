@@ -94,7 +94,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  *
  * `revalidate` opts into Next's fetch cache for the read-heavy fallback path.
  */
-async function shopifyGraphQL<T>(
+// Exported so other server-only modules (lib/shipping-bootstrap's Shopify
+// pull) can reuse the same throttle-aware client instead of duplicating it.
+export async function shopifyGraphQL<T>(
   query: string,
   variables: Record<string, unknown> = {},
   opts: { revalidate?: number; tags?: string[] } = {},

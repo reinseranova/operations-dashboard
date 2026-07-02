@@ -5,6 +5,14 @@
     {
       "path": "/api/refresh",
       "schedule": "0 7 * * *"
+    },
+    {
+      "path": "/api/shipping-stats?location=cn&bust=1",
+      "schedule": "0 4 * * *"
+    },
+    {
+      "path": "/api/shipping-stats?location=us&bust=1",
+      "schedule": "5 4 * * *"
     }
   ]
 }

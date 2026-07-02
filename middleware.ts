@@ -12,7 +12,21 @@ const SESSION_COOKIE = "ops_session";
 const SESSION_MARKER = "ops-dashboard-session-v1";
 
 // Paths that never require auth.
-const PUBLIC_PATHS = ["/login", "/api/login"];
+const PUBLIC_PATHS = [
+  "/login",
+  "/api/login",
+  // Server-to-server shipping endpoints, exempted for the same reason
+  // /api/refresh is below: external callers (ParcelPanel, ShipHero, our own
+  // Bearer-secret cron/admin calls) can't hold the login session cookie.
+  // Each authenticates itself (HMAC signature or REFRESH_SECRET).
+  "/api/webhooks/parcelpanel",
+  "/api/webhooks/shiphero-shipment",
+  "/api/shipping-bootstrap",
+  // Not session-cookie-only: the nightly cache-warming cron in vercel.json
+  // calls this with Bearer $CRON_SECRET instead. The route itself enforces
+  // auth (session cookie OR secret) — see app/api/shipping-stats/route.ts.
+  "/api/shipping-stats",
+];
 
 function isPublic(pathname: string): boolean {
   return PUBLIC_PATHS.some(

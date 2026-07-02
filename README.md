@@ -96,6 +96,7 @@ settings for production. See `.env.example` for a copy-paste template.
 | `SHIPHERO_ACCESS_TOKEN` | No | Optional; the app mints an access token from the refresh token and caches it, so this isn't required. |
 | `CRON_SECRET` | Vercel only | Set equal to `REFRESH_SECRET`; Vercel auto-attaches it to scheduled cron calls. |
 | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | No | Auto-injected by Vercel when you connect KV/Upstash. Enables cached snapshots. |
+| `PARCELPANEL_API_KEY` | No | From ParcelPanel Dashboard → Integration → API Keys. Verifies incoming ParcelPanel webhook signatures for the Shipping Performance page. Until set, that page shows realistic sample data with a "Showing sample shipping data" banner (webhook signatures can never verify without it, so no real data is ever written). |
 
 ---
 
@@ -143,6 +144,45 @@ free-tier limit). For more frequent refreshes, use a paid Vercel plan or a free
 external pinger (e.g. cron-job.org) calling
 `https://<your-app>/api/refresh?secret=<REFRESH_SECRET>`. Details are in the
 comment at the top of `app/api/refresh/route.ts`.
+
+---
+
+## Shipping Performance page
+
+`/shipping-performance` tracks processing → pickup → transit → delivery times
+for the two fulfillment locations — **Lansil China** (no WMS API; ParcelPanel
+is the only data source) and **Lansil USA** (ShipHero + ParcelPanel). Requires
+Vercel KV (it stores raw per-day metric lists under `ship:{loc}:{metric}:{day}`
+keys — see `lib/shipping-storage.ts`); without KV there's nowhere to persist
+webhook data and the page always shows sample data.
+
+**Setup, in order:**
+
+1. Add `PARCELPANEL_API_KEY` (see the env var table above).
+2. In ParcelPanel Dashboard → Integration → Webhooks, register:
+   - URL: `https://<your-domain>/api/webhooks/parcelpanel`
+   - Event: `shipment_status/any_update`
+3. In ShipHero, register a **Shipment Update** webhook (gives precise USA
+   pickup timing instead of falling back to fulfillment date):
+   - URL: `https://<your-domain>/api/webhooks/shiphero-shipment`
+   - Set a custom header `x-refresh-secret: <REFRESH_SECRET>` (this webhook
+     reuses `REFRESH_SECRET` rather than adding another secret env var).
+4. Run the one-time historical seed (backfills ~30 days of processing time
+   from Shopify so the page isn't empty while transit/pickup data accumulates
+   from live webhooks over the following weeks):
+   ```bash
+   curl -X POST https://<your-domain>/api/shipping-bootstrap \
+     -H "Authorization: Bearer <REFRESH_SECRET>"
+   ```
+5. **Verify location names.** ParcelPanel's `location.name` webhook field is
+   what routes each shipment to China vs. USA (`lib/shipping-location.ts`).
+   The webhook route logs the first 20 payloads it sees
+   (`location.name` + carrier + status) — check those logs after step 2 and
+   confirm they match `LOCATION_NAME_MAP` in that file; add alternate
+   spellings there if they don't.
+
+The nightly cron in `vercel.json` pre-warms the 15-minute stats cache for both
+locations at 4 AM so the first page load of the day is instant.
 
 ---
 
