@@ -22,12 +22,6 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Set true only while verifying LOCATION_NAME_MAP against live payloads (see
-// lib/shipping-location.ts) — logs payload.location.name for the first 20
-// webhooks this instance sees, then stops.
-let loggedPayloads = 0;
-const MAX_LOGGED_PAYLOADS = 20;
-
 export async function POST(req: NextRequest) {
   const rawBody = await req.text();
   const signature = req.headers.get("X-ParcelPanel-HMAC-SHA256") ?? "";
@@ -38,13 +32,6 @@ export async function POST(req: NextRequest) {
 
   try {
     const payload: PPWebhook = JSON.parse(rawBody);
-
-    if (loggedPayloads < MAX_LOGGED_PAYLOADS) {
-      loggedPayloads++;
-      console.log(
-        `[pp-webhook] (${loggedPayloads}/${MAX_LOGGED_PAYLOADS}) location.name="${payload.location?.name}" carrier="${payload.carrier?.code}" status=${payload.status}`,
-      );
-    }
 
     const loc = resolveLocation(payload.location?.name, payload.carrier?.code ?? "");
 
