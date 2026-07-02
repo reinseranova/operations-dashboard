@@ -49,12 +49,12 @@ function LotDetail({ row }: { row: SkuRow }) {
         </thead>
         <tbody>
           {row.lots.map((lot, i) => (
-            <tr key={`${lot.lotNumber}-${lot.warehouseKey}-${i}`} className="border-t border-slate-100">
+            <tr key={`${lot.lotNumber ?? "no-lot"}-${lot.warehouseKey}-${i}`} className="border-t border-slate-100">
               <td className="py-1.5 pr-4 uppercase text-slate-600">
                 {lot.warehouseKey}
               </td>
               <td className="py-1.5 pr-4 font-mono text-slate-800">
-                {lot.lotNumber}
+                {lot.lotNumber ?? <span className="text-slate-400">no lot</span>}
               </td>
               <td className="py-1.5 pr-4 tabular-nums text-slate-800">
                 {fmt(lot.quantity)}

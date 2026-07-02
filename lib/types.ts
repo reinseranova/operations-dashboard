@@ -4,7 +4,8 @@ import type { WarehouseKey } from "./config";
 export interface Lot {
   warehouseKey: WarehouseKey;
   warehouseName: string;
-  lotNumber: string;
+  /** null when the bin has stock but no lot is assigned to it. */
+  lotNumber: string | null;
   quantity: number;
   /** ISO date (YYYY-MM-DD) or null when the lot has no expiration. */
   expirationDate: string | null;
@@ -31,23 +32,9 @@ export interface SkuRow {
   lots: Lot[];
 }
 
-/** The six ShipHero hold booleans, surfaced as per-type counts. */
-export interface HoldsBreakdown {
-  fraud_hold: number;
-  address_hold: number;
-  shipping_method_hold: number;
-  operator_hold: number;
-  payment_hold: number;
-  client_hold: number;
-}
-
 /** The top-of-page daily summary strip. */
 export interface DailySummary {
   ordersFulfilledToday: number;
-  ordersOnHold: {
-    total: number;
-    breakdown: HoldsBreakdown;
-  };
   /**
    * Returns received/processed today. In ShipHero these are a single event, so
    * we surface one number (see lib/shiphero.ts).
@@ -100,7 +87,6 @@ export interface ShipHeroInventory {
 /** Raw daily fulfillment summary returned by the ShipHero layer. */
 export interface ShipHeroSummary {
   ordersFulfilledToday: number;
-  ordersOnHold: { total: number; breakdown: HoldsBreakdown };
   returnsToday: number;
   newReceivalsToday: number;
 }
@@ -115,4 +101,10 @@ export interface ShopifyMeta {
     bulkOperationId: string | null;
     startedAt: string | null;
   };
+  /**
+   * Bumped whenever BUNDLE_MAP/SKU_ALIASES/FREEBIE_SKUS change shape so stored
+   * daily units-by-SKU entries (computed under the old expansion rules) get
+   * invalidated instead of silently polluting new totals. See lib/shopify.ts.
+   */
+  bundleMapVersion?: number;
 }

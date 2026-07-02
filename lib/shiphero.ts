@@ -5,7 +5,7 @@
  * live schema reference at developer.shiphero.com/schema/queries/):
  *   - Every top-level query returns `{ request_id, complexity, data }`; `data`
  *     is a connection for list queries.
- *   - FILTER arguments (warehouse_id, sku, updated_from, has_hold, …) go on the
+ *   - FILTER arguments (warehouse_id, sku, updated_from, …) go on the
  *     top-level query field. PAGINATION (`first`, `after`) goes on the inner
  *     `data(...)` connection — NOT on the query field.
  *   - Cursor pagination: read `data.pageInfo { hasNextPage, endCursor }` and
@@ -15,16 +15,16 @@
  * Metric → query mapping:
  *   - Stock per SKU per warehouse …… `warehouse_products(warehouse_id)` → on_hand
  *   - Warehouse IDs (by name) ……… `account` → data.warehouses (cached)
- *   - Lots per SKU …………………… `expiration_lots` → Lot + nested locations
- *   - Orders on hold + breakdown … `orders(has_hold: true)` → holds { … }
- *   - Orders fulfilled today ……… `orders(fulfillment_status, updated_from)`
+ *   - Lots per SKU …………………… `warehouse_products(warehouse_id).locations`
+ *     → ItemLocation.quantity + ItemLocation.expiration_lot (NOT Location.quantity)
+ *   - Orders fulfilled today ……… `shipments(date_from, date_to)` → distinct order_id
  *   - Returns received today ……… `returns(date_from)` → created_at
  *   - New receivals today ………… `warehouse_products(updated_from).inbounds`
  *
  * Resilience: the core (warehouse resolution + stock) surfaces errors so the UI
- * shows a clear banner. Secondary metrics (holds, fulfilled, returns, receivals,
- * lots) each degrade to a safe default and add a human-readable warning instead
- * of taking down the whole dashboard. GraphQL errors carry the raw response body
+ * shows a clear banner. Secondary metrics (fulfilled, returns, receivals, lots)
+ * each degrade to a safe default and add a human-readable warning instead of
+ * taking down the whole dashboard. GraphQL errors carry the raw response body
  * so any schema mismatch is diagnosable from the banner / logs.
  */
 import {
@@ -35,12 +35,7 @@ import {
   type WarehouseKey,
 } from "./config";
 import { isKvConfigured, kvGet, kvSet } from "./kv";
-import type {
-  HoldsBreakdown,
-  Lot,
-  ShipHeroInventory,
-  ShipHeroSummary,
-} from "./types";
+import type { Lot, ShipHeroInventory, ShipHeroSummary } from "./types";
 
 export interface InventoryResult {
   inventory: ShipHeroInventory;
@@ -50,17 +45,6 @@ export interface InventoryResult {
 export interface SummaryResult {
   summary: ShipHeroSummary;
   warnings: string[];
-}
-
-function emptyBreakdown(): HoldsBreakdown {
-  return {
-    fraud_hold: 0,
-    address_hold: 0,
-    shipping_method_hold: 0,
-    operator_hold: 0,
-    payment_hold: 0,
-    client_hold: 0,
-  };
 }
 
 function warehouseNameFor(key: WarehouseKey): string {
@@ -324,17 +308,6 @@ async function resolveWarehouseIds(): Promise<WarehouseIdMap> {
   return map;
 }
 
-function keyForWarehouseId(
-  ids: WarehouseIdMap,
-  id: string | null,
-): WarehouseKey | null {
-  if (!id) return null;
-  for (const key of Object.keys(ids) as WarehouseKey[]) {
-    if (ids[key].includes(id)) return key;
-  }
-  return null;
-}
-
 // ===========================================================================
 // Inventory: stock per SKU per warehouse (+ best-effort lots)
 // ===========================================================================
@@ -447,17 +420,23 @@ export async function getShipHeroInventory(): Promise<InventoryResult> {
   return { inventory: { skus: Array.from(skuMap.values()) }, warnings };
 }
 
-interface ExpirationLotsPage {
-  expiration_lots: {
+interface LotsPage {
+  warehouse_products: {
     data: {
       edges: Array<{
         node: {
-          name: string | null;
           sku: string | null;
-          expires_at: string | null;
           locations: {
             edges: Array<{
-              node: { quantity: number | null; warehouse_id: string | null };
+              node: {
+                // node here is ItemLocation, NOT Location — quantity and
+                // expiration_lot live here; Location itself has no quantity.
+                quantity: number | null;
+                expiration_lot: {
+                  name: string | null;
+                  expires_at: string | null;
+                } | null;
+              };
             }>;
           } | null;
         };
@@ -468,30 +447,103 @@ interface ExpirationLotsPage {
 }
 
 /**
- * Attach lots per SKU/warehouse.
+ * Attach lot detail to each SKU, keyed by warehouse + lot number.
  *
- * TEMPORARILY DISABLED: the `expiration_lots` → `locations` path we tried does
- * not expose a per-lot `quantity` on the `Location` type ("Cannot query field
- * 'quantity' on type 'Location'"), and enumerating all lots is an expensive
- * extra paginated query. Stock and days-of-stock (the core metrics) don't need
- * it, and the UI shows "No lot detail reported" gracefully. The correct
- * warehouse-scoped path with quantities is `warehouse_products.locations`
- * (ItemLocation) → `expiration_lot`; wire that here once its exact field names
- * are confirmed against the live schema, and nothing else needs to change.
+ * Uses `warehouse_products(warehouse_id).locations` (ItemLocation), whose
+ * `quantity` field is on ItemLocation, not the nested `Location`. The same
+ * lot is typically split across several bins, which isn't useful to show
+ * separately — quantities for the same (warehouse, lot number) are summed
+ * into a single row. Bins with stock but no lot assigned are grouped the
+ * same way under `lotNumber: null` rather than being dropped.
  */
 async function attachLots(
-  _skuMap: Map<string, SkuEntry>,
-  _ids: WarehouseIdMap,
+  skuMap: Map<string, SkuEntry>,
+  ids: WarehouseIdMap,
 ): Promise<void> {
-  // Reference the interfaces/helpers so they remain valid for the future impl.
-  void (null as unknown as ExpirationLotsPage);
-  void keyForWarehouseId;
-  void warehouseNameFor;
-  return;
+  // sku -> "warehouseKey|lotNumber" -> accumulated Lot
+  const grouped = new Map<string, Map<string, Lot>>();
+
+  const addLot = (sku: string, lot: Lot) => {
+    const bySku = grouped.get(sku) ?? new Map<string, Lot>();
+    const groupKey = `${lot.warehouseKey}|${lot.lotNumber ?? ""}`;
+    const existing = bySku.get(groupKey);
+    if (existing) {
+      existing.quantity += lot.quantity;
+    } else {
+      bySku.set(groupKey, lot);
+    }
+    grouped.set(sku, bySku);
+  };
+
+  for (const { key } of WAREHOUSES) {
+    for (const warehouseId of ids[key]) {
+      let cursor: string | null = null;
+      do {
+        const data: LotsPage = await shipheroGraphQL<LotsPage>(
+          /* GraphQL */ `
+            query Lots($cursor: String, $warehouseId: String!) {
+              warehouse_products(warehouse_id: $warehouseId) {
+                data(first: 20, after: $cursor) {
+                  edges {
+                    node {
+                      sku
+                      locations {
+                        edges {
+                          node {
+                            quantity
+                            expiration_lot {
+                              name
+                              expires_at
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            }
+          `,
+          { cursor, warehouseId },
+        );
+
+        for (const edge of data.warehouse_products.data.edges) {
+          const sku = edge.node.sku;
+          if (!sku || !skuMap.has(sku)) continue;
+
+          for (const locEdge of edge.node.locations?.edges ?? []) {
+            const quantity = locEdge.node.quantity ?? 0;
+            if (quantity <= 0) continue;
+            const lot = locEdge.node.expiration_lot;
+            addLot(sku, {
+              warehouseKey: key,
+              warehouseName: warehouseNameFor(key),
+              lotNumber: lot?.name ?? null,
+              quantity,
+              expirationDate: lot?.expires_at ? lot.expires_at.slice(0, 10) : null,
+            });
+          }
+        }
+
+        cursor = data.warehouse_products.data.pageInfo.hasNextPage
+          ? data.warehouse_products.data.pageInfo.endCursor
+          : null;
+      } while (cursor && budgetLeft());
+    }
+  }
+
+  for (const [sku, bySku] of grouped) {
+    const entry = skuMap.get(sku);
+    if (entry) entry.lots = Array.from(bySku.values());
+  }
 }
 
 // ===========================================================================
-// Summary: fulfilled today, holds, returns, receivals
+// Summary: fulfilled today, returns, receivals
 // ===========================================================================
 
 function todayIso(): string {
@@ -516,12 +568,6 @@ export async function getShipHeroSummary(): Promise<SummaryResult> {
     "New receivals today",
     warnings,
   );
-  const ordersOnHold = await safe(
-    () => fetchOrdersOnHold(),
-    { total: 0, breakdown: emptyBreakdown() },
-    "Orders on hold",
-    warnings,
-  );
   const ordersFulfilledToday = await safe(
     () => countFulfilledToday(today),
     0,
@@ -530,7 +576,7 @@ export async function getShipHeroSummary(): Promise<SummaryResult> {
   );
 
   return {
-    summary: { ordersFulfilledToday, ordersOnHold, returnsToday, newReceivalsToday },
+    summary: { ordersFulfilledToday, returnsToday, newReceivalsToday },
     warnings,
   };
 }
@@ -551,19 +597,21 @@ async function safe<T>(
   }
 }
 
-interface HoldsOrdersPage {
-  orders: {
+function nextDayIso(dateIso: string): string {
+  const d = new Date(`${dateIso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+interface ShipmentsPage {
+  shipments: {
     data: {
       edges: Array<{
         node: {
-          holds: {
-            fraud_hold: boolean | null;
-            address_hold: boolean | null;
-            shipping_method_hold: boolean | null;
-            operator_hold: boolean | null;
-            payment_hold: boolean | null;
-            client_hold: boolean | null;
-          } | null;
+          id: string;
+          order_id: string | null;
+          warehouse_id: string | null;
+          created_date: string | null;
         };
       }>;
       pageInfo: { hasNextPage: boolean; endCursor: string | null };
@@ -571,113 +619,53 @@ interface HoldsOrdersPage {
   };
 }
 
-/** Current orders on hold: total (any hold true) + per-type breakdown. */
-async function fetchOrdersOnHold(): Promise<{
-  total: number;
-  breakdown: HoldsBreakdown;
-}> {
-  const breakdown = emptyBreakdown();
-  let total = 0;
+/**
+ * Orders fulfilled (shipped) today: distinct order_id across shipment
+ * records created today. Shipments carry their own created_date — the
+ * timestamp the label was generated/confirmed — unlike
+ * Order.fulfillment_status, which is a mutable current-state snapshot that
+ * can drift from "shipped today" (an order fulfilled yesterday but edited
+ * today would match; an order shipped today whose status later changes
+ * wouldn't). A single order can produce more than one shipment (split
+ * shipment), so we count distinct order_id, not shipment rows.
+ */
+async function countFulfilledToday(today: string): Promise<number> {
+  const orderIds = new Set<string>();
   let cursor: string | null = null;
-
   do {
-    const data: HoldsOrdersPage = await shipheroGraphQL<HoldsOrdersPage>(
+    const data: ShipmentsPage = await shipheroGraphQL<ShipmentsPage>(
       /* GraphQL */ `
-        query HeldOrders($cursor: String) {
-          orders(has_hold: true) {
-            # Smaller page so a single request returns within the request timeout.
-            data(first: 50, after: $cursor) {
-              edges {
-                node {
-                  holds {
-                    fraud_hold
-                    address_hold
-                    shipping_method_hold
-                    operator_hold
-                    payment_hold
-                    client_hold
-                  }
-                }
-              }
+        query Shipments($cursor: String, $from: ISODateTime, $to: ISODateTime) {
+          shipments(date_from: $from, date_to: $to) {
+            request_id
+            complexity
+            data(first: 100, after: $cursor) {
               pageInfo {
                 hasNextPage
                 endCursor
               }
-            }
-          }
-        }
-      `,
-      { cursor },
-    );
-
-    for (const edge of data.orders.data.edges) {
-      const h = edge.node.holds;
-      if (!h) continue;
-      const any =
-        h.fraud_hold ||
-        h.address_hold ||
-        h.shipping_method_hold ||
-        h.operator_hold ||
-        h.payment_hold ||
-        h.client_hold;
-      if (!any) continue;
-      total++;
-      if (h.fraud_hold) breakdown.fraud_hold++;
-      if (h.address_hold) breakdown.address_hold++;
-      if (h.shipping_method_hold) breakdown.shipping_method_hold++;
-      if (h.operator_hold) breakdown.operator_hold++;
-      if (h.payment_hold) breakdown.payment_hold++;
-      if (h.client_hold) breakdown.client_hold++;
-    }
-
-    cursor = data.orders.data.pageInfo.hasNextPage
-      ? data.orders.data.pageInfo.endCursor
-      : null;
-  } while (cursor && budgetLeft());
-
-  return { total, breakdown };
-}
-
-interface IdOrdersPage {
-  orders: {
-    data: {
-      edges: Array<{ node: { id: string } }>;
-      pageInfo: { hasNextPage: boolean; endCursor: string | null };
-    };
-  };
-}
-
-/** Orders fulfilled today: fulfillment_status "fulfilled", updated today. */
-async function countFulfilledToday(today: string): Promise<number> {
-  let count = 0;
-  let cursor: string | null = null;
-  do {
-    const data: IdOrdersPage = await shipheroGraphQL<IdOrdersPage>(
-      /* GraphQL */ `
-        query Fulfilled($cursor: String, $date: ISODateTime) {
-          orders(fulfillment_status: "fulfilled", updated_from: $date) {
-            data(first: 100, after: $cursor) {
               edges {
                 node {
                   id
+                  order_id
+                  warehouse_id
+                  created_date
                 }
-              }
-              pageInfo {
-                hasNextPage
-                endCursor
               }
             }
           }
         }
       `,
-      { cursor, date: dayStart(today) },
+      { cursor, from: dayStart(today), to: dayStart(nextDayIso(today)) },
     );
-    count += data.orders.data.edges.length;
-    cursor = data.orders.data.pageInfo.hasNextPage
-      ? data.orders.data.pageInfo.endCursor
+    for (const edge of data.shipments.data.edges) {
+      if (edge.node.order_id) orderIds.add(edge.node.order_id);
+    }
+    cursor = data.shipments.data.pageInfo.hasNextPage
+      ? data.shipments.data.pageInfo.endCursor
       : null;
   } while (cursor && budgetLeft());
-  return count;
+  return orderIds.size;
 }
 
 interface ReturnsPage {
