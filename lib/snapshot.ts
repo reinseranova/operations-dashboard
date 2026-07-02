@@ -178,6 +178,28 @@ export async function refreshSnapshot(): Promise<Snapshot> {
 }
 
 /**
+ * A stored snapshot is untrusted input from the dashboard's point of view — it
+ * may predate a shape change, or (KV instances are sometimes shared across a
+ * project's Preview/Production environments) belong to a different deployment
+ * entirely. Rather than trust it blindly and let a missing field crash the
+ * page deep inside a component, check the fields every renderer dereferences
+ * without a null-guard before treating it as valid.
+ */
+function isValidSnapshot(v: unknown): v is Snapshot {
+  if (!v || typeof v !== "object") return false;
+  const s = v as Partial<Snapshot>;
+  return (
+    Array.isArray(s.skus) &&
+    typeof s.generatedAt === "string" &&
+    !!s.summary &&
+    typeof s.summary.ordersOnHold === "object" &&
+    s.summary.ordersOnHold !== null &&
+    typeof s.summary.ordersOnHold.breakdown === "object" &&
+    s.summary.ordersOnHold.breakdown !== null
+  );
+}
+
+/**
  * What the dashboard calls. Prefers the stored KV snapshot (instant); on a cache
  * miss it computes once AND stores, so subsequent loads are fast. Without KV it
  * always computes live — fine for low volume, but on this store's order volume
@@ -187,8 +209,13 @@ export async function refreshSnapshot(): Promise<Snapshot> {
 export async function getSnapshotForDashboard(): Promise<Snapshot> {
   if (isKvConfigured()) {
     const stored = await kvGet<Snapshot>(KV_KEYS.snapshot);
-    if (stored) return stored;
-    return refreshSnapshot(); // first run: compute + persist for next time
+    if (stored) {
+      if (isValidSnapshot(stored)) return stored;
+      console.error(
+        "[snapshot] Stored dashboard:snapshot has an unexpected shape — recomputing instead of crashing the page.",
+      );
+    }
+    return refreshSnapshot(); // first run (or invalid stored value): compute + persist for next time
   }
   return computeSnapshot();
 }
